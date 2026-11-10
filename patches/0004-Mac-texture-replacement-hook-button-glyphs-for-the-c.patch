@@ -1,0 +1,597 @@
+From a05ae928365ede8f30af6d2694b75ace7e651ad6 Mon Sep 17 00:00:00 2001
+From: LeoDeadware <351117497+LeoDeadware@users.noreply.github.com>
+Date: Fri, 6 Nov 2026 22:40:10 +0200
+Subject: [PATCH 04/24] Mac: texture replacement hook + button glyphs for the
+ connected pad
+
+- nv2a_metal: nv2a_tex_replace_hook (full FNV-64 of the guest bytes, decoded
+  pixels in, k-times-larger BGRA8 out; nv2a_tex_replace_gen re-asks)
+- apple_textures.m: providers, NFSU2_TEX_DUMP=<dir> PNG dump of new textures
+- apple_prompts.m: PlayStation pad -> cross/circle/square/triangle, L2/R2;
+  other pads -> LT/RT; drawn with CoreGraphics at 4x in the original's ring
+  and colour; follows pad hot-plug (NFSU2_PROMPTS=auto|ps|xbox|0)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ CMakeLists.txt                         |   9 +-
+ src/apple/apple_prompts.m              | 246 +++++++++++++++++++++++++
+ src/apple/apple_textures.h             |  15 ++
+ src/apple/apple_textures.m             | 100 ++++++++++
+ src/main.c                             |   3 +
+ xboxrecomp/src/kernel/nv2a_backend.h   |  15 ++
+ xboxrecomp/src/nv2a_metal/nv2a_metal.m |  81 +++++++-
+ 7 files changed, 465 insertions(+), 4 deletions(-)
+ create mode 100644 src/apple/apple_prompts.m
+ create mode 100644 src/apple/apple_textures.h
+ create mode 100644 src/apple/apple_textures.m
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index c82f661..65efad7 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -84,10 +84,15 @@ if(APPLE)
+     set_property(SOURCE ${NFSU2_MANUAL_SOURCE} APPEND PROPERTY COMPILE_OPTIONS "-ffp-contract=off")
+     enable_language(OBJC)
+     target_sources(${PROJECT_NAME} PRIVATE src/apple/apple_main.c src/apple/apple_game_state.c src/apple/apple_perf.m
+-                                           src/apple/apple_keyboard.c)
++                                           src/apple/apple_keyboard.c src/apple/apple_textures.m
++                                           src/apple/apple_prompts.m)
++    target_compile_definitions(${PROJECT_NAME} PRIVATE NFSU2_APPLE_TEXTURES=1)
++    set_source_files_properties(src/apple/apple_textures.m src/apple/apple_prompts.m
++                                PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
+     set_source_files_properties(src/apple/apple_perf.m PROPERTIES COMPILE_OPTIONS "-fobjc-arc"
+                                 INCLUDE_DIRECTORIES "${XBOXRECOMP_DIR}/src/apu")
+-    target_link_libraries(${PROJECT_NAME} PRIVATE "-framework Foundation")
++    target_link_libraries(${PROJECT_NAME} PRIVATE "-framework Foundation" "-framework CoreGraphics"
++                          "-framework ImageIO" "-framework CoreText")
+ endif()
+ 
+ # iOS app: SDL's UIKit glue runs apple_main.c's main as SDL_main; Vulkan via
+diff --git a/src/apple/apple_prompts.m b/src/apple/apple_prompts.m
+new file mode 100644
+index 0000000..a93d464
+--- /dev/null
++++ b/src/apple/apple_prompts.m
+@@ -0,0 +1,246 @@
++/**
++ * Button prompts for the connected pad (Deadware, NFSU2 on the Mac).
++ *
++ * The game's prompt glyphs are 32x32 textures, one per button (white-green
++ * outline, tinted by the game): A, B, X, Y in a ring, L and R in a rounded
++ * square. Hashes from NFSU2_TEX_DUMP (apple_textures.m) of the menus and a
++ * race. With a PlayStation pad (SDL type PS3/PS4/PS5) they are redrawn,
++ * procedurally (CoreGraphics; nothing derived from game data is stored), at
++ * 4x: A -> cross, B -> circle, X -> square, Y -> triangle, L -> L2, R -> R2.
++ * With any other pad A/B/X/Y stay the game's own (same letters as an Xbox
++ * pad) and L/R become LT/RT. The new glyph keeps the original's ring (its
++ * alpha's box and stroke width) and colour.
++ *
++ *   NFSU2_PROMPTS=auto   (default) by the first connected pad
++ *                =ps     PlayStation glyphs   =xbox  LT/RT only
++ *                =0      the original glyphs
++ *   NFSU2_PROMPTS_DUMP=<dir>  write every replacement as <hash>.png
++ */
++#import <CoreGraphics/CoreGraphics.h>
++#import <CoreText/CoreText.h>
++#import <Foundation/Foundation.h>
++
++#include <SDL.h>
++#include <math.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++
++#include "apple_textures.h"
++
++enum { G_A, G_B, G_X, G_Y, G_L, G_R };
++static const struct { uint64_t hash; int kind; } s_glyphs[] = {
++    { 0x54df260d4ffaf22cull, G_A },
++    { 0x1137202d59bc1d0cull, G_B },
++    { 0xaf275789392c7faaull, G_X },
++    { 0x0b82d7831da83536ull, G_Y },
++    { 0x03c0f7aadce27211ull, G_L },
++    { 0xf3cbccb25d489f28ull, G_R },
++};
++
++enum { F_OFF, F_XBOX, F_PS };
++static int s_mode = -1;                 /* -1 auto, else F_* */
++static volatile int s_family = F_XBOX;
++static int s_watch;
++static const char *s_dump;
++
++static int pad_family(void)
++{
++    int i, n = SDL_NumJoysticks();
++    for (i = 0; i < n; i++) {
++        if (!SDL_IsGameController(i))
++            continue;
++        switch (SDL_GameControllerTypeForIndex(i)) {
++        case SDL_CONTROLLER_TYPE_PS3:
++        case SDL_CONTROLLER_TYPE_PS4:
++        case SDL_CONTROLLER_TYPE_PS5:
++            return F_PS;
++        default:
++            return F_XBOX;
++        }
++    }
++    return F_XBOX;
++}
++
++static void set_family(int f)
++{
++    if (f != s_family) {
++        s_family = f;
++        nv2a_tex_replace_gen++;
++        fprintf(stderr, "[prompts] %s button glyphs\n", f == F_PS ? "PlayStation" :
++                f == F_XBOX ? "Xbox" : "original");
++    }
++}
++
++static int SDLCALL on_event(void *u, SDL_Event *e)
++{
++    (void)u;
++    if (e->type == SDL_CONTROLLERDEVICEADDED || e->type == SDL_CONTROLLERDEVICEREMOVED)
++        set_family(pad_family());
++    return 0;
++}
++
++void nfsu2_prompts_poll(void)
++{
++    if (s_mode < 0 && !s_watch) {
++        s_watch = 1;
++        SDL_AddEventWatch(on_event, NULL);
++        set_family(pad_family());
++    }
++}
++
++/* The original's ring: alpha box, stroke width, colour. */
++typedef struct { double x0, y0, x1, y1, stroke; double r, g, b; } Ring;
++
++static void measure(const uint32_t *px, uint32_t w, uint32_t h, Ring *o)
++{
++    uint32_t x, y, n = 0, x0 = w, x1 = 0, y0 = h, y1 = 0, run = 0, best = 0;
++    double r = 0, g = 0, b = 0;
++    for (y = 0; y < h; y++)
++        for (x = 0; x < w; x++) {
++            uint32_t c = px[y * w + x], a = c >> 24;
++            if (a < 96) continue;
++            if (x < x0) x0 = x;
++            if (x > x1) x1 = x;
++            if (y < y0) y0 = y;
++            if (y > y1) y1 = y;
++            if (a > 200) {
++                r += (c >> 16) & 255; g += (c >> 8) & 255; b += c & 255; n++;
++            }
++        }
++    if (x1 < x0) { x0 = y0 = 0; x1 = w - 1; y1 = h - 1; }
++    /* Stroke: opaque run from the box's left edge along the middle row. */
++    y = (y0 + y1) / 2;
++    for (x = x0; x <= x1 && (px[y * w + x] >> 24) >= 96; x++)
++        run++;
++    best = run ? run : 2;
++    o->x0 = x0; o->x1 = x1 + 1; o->y0 = y0; o->y1 = y1 + 1;
++    o->stroke = best;
++    o->r = n ? r / n / 255.0 : 0.85; o->g = n ? g / n / 255.0 : 1.0; o->b = n ? b / n / 255.0 : 0.85;
++}
++
++static void text_in(CGContextRef c, const char *s, double cx, double cy, double height)
++{
++    CTFontRef f = CTFontCreateWithName(CFSTR("Helvetica-Bold"), height, NULL);
++    CGColorRef col = CGColorCreateGenericRGB(1, 1, 1, 1);
++    CFStringRef str = CFStringCreateWithCString(NULL, s, kCFStringEncodingUTF8);
++    const void *keys[] = { kCTFontAttributeName, kCTForegroundColorAttributeName };
++    const void *vals[] = { f, col };
++    CFDictionaryRef at = CFDictionaryCreate(NULL, keys, vals, 2, &kCFTypeDictionaryKeyCallBacks,
++                                            &kCFTypeDictionaryValueCallBacks);
++    CFAttributedStringRef as = CFAttributedStringCreate(NULL, str, at);
++    CTLineRef line = CTLineCreateWithAttributedString(as);
++    CGRect bb = CTLineGetImageBounds(line, c);
++    CGContextSetTextPosition(c, cx - bb.size.width / 2 - bb.origin.x,
++                             cy - bb.size.height / 2 - bb.origin.y);
++    CTLineDraw(line, c);
++    CFRelease(line); CFRelease(as); CFRelease(at); CFRelease(str); CFRelease(col); CFRelease(f);
++}
++
++#define K 4
++static uint32_t s_out[32 * K * 32 * K];
++
++static const uint32_t *draw(const Nv2aTexInfo *ti, int kind, int family)
++{
++    uint32_t W = ti->w * K, H = ti->h * K, i;
++    CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
++    CGContextRef c = CGBitmapContextCreate(s_out, W, H, 8, W * 4, cs,
++        kCGImageAlphaPremultipliedFirst | kCGBitmapByteOrder32Little);
++    Ring g;
++    double x0, y0, x1, y1, t, cx, cy, rr;
++
++    CGColorSpaceRelease(cs);
++    if (!c)
++        return NULL;
++    measure(ti->argb, ti->w, ti->h, &g);
++    /* CoreGraphics is y-up; texture row 0 is the top. */
++    x0 = g.x0 * K; x1 = g.x1 * K; y0 = H - g.y1 * K; y1 = H - g.y0 * K;
++    t = g.stroke * K;
++    cx = (x0 + x1) / 2; cy = (y0 + y1) / 2;
++    rr = ((x1 - x0) < (y1 - y0) ? (x1 - x0) : (y1 - y0)) / 2;
++    CGContextClearRect(c, CGRectMake(0, 0, W, H));
++    CGContextSetRGBStrokeColor(c, 1, 1, 1, 1);
++    CGContextSetRGBFillColor(c, 1, 1, 1, 1);
++    CGContextSetLineWidth(c, t);
++    CGContextSetLineCap(c, kCGLineCapRound);
++    CGContextSetLineJoin(c, kCGLineJoinRound);
++    if (kind <= G_Y) {
++        double s = rr * 0.42;
++        CGContextStrokeEllipseInRect(c, CGRectMake(cx - rr + t / 2, cy - rr + t / 2,
++                                                   2 * rr - t, 2 * rr - t));
++        CGContextSetLineWidth(c, t * 0.9);
++        if (kind == G_A) {                              /* cross */
++            CGContextMoveToPoint(c, cx - s, cy - s); CGContextAddLineToPoint(c, cx + s, cy + s);
++            CGContextMoveToPoint(c, cx - s, cy + s); CGContextAddLineToPoint(c, cx + s, cy - s);
++            CGContextStrokePath(c);
++        } else if (kind == G_B) {                       /* circle */
++            CGContextStrokeEllipseInRect(c, CGRectMake(cx - s * 1.05, cy - s * 1.05, s * 2.1, s * 2.1));
++        } else if (kind == G_X) {                       /* square */
++            CGContextStrokeRect(c, CGRectMake(cx - s * 0.9, cy - s * 0.9, s * 1.8, s * 1.8));
++        } else {                                        /* triangle */
++            double R = s * 1.15, oy = -s * 0.15;
++            CGContextMoveToPoint(c, cx, cy + oy + R);
++            CGContextAddLineToPoint(c, cx - R * 0.866, cy + oy - R * 0.5);
++            CGContextAddLineToPoint(c, cx + R * 0.866, cy + oy - R * 0.5);
++            CGContextClosePath(c);
++            CGContextStrokePath(c);
++        }
++    } else {
++        CGPathRef p = CGPathCreateWithRoundedRect(
++            CGRectMake(x0 + t / 2, y0 + t / 2, x1 - x0 - t, y1 - y0 - t),
++            (x1 - x0) * 0.18, (y1 - y0) * 0.18, NULL);
++        const char *lab = family == F_PS ? (kind == G_L ? "L2" : "R2")
++                                         : (kind == G_L ? "LT" : "RT");
++        CGContextAddPath(c, p);
++        CGContextStrokePath(c);
++        CGPathRelease(p);
++        text_in(c, lab, cx, cy, (y1 - y0) * 0.5);
++    }
++    CGContextRelease(c);
++    /* White drawing -> the original's colour, straight alpha. */
++    for (i = 0; i < W * H; i++) {
++        uint32_t a = s_out[i] >> 24;
++        s_out[i] = a << 24 | (uint32_t)lround(g.r * 255) << 16 |
++                   (uint32_t)lround(g.g * 255) << 8 | (uint32_t)lround(g.b * 255);
++    }
++    if (s_dump) {
++        char path[1024];
++        snprintf(path, sizeof path, "%s/%016llx_%s.png", s_dump, (unsigned long long)ti->hash,
++                 family == F_PS ? "ps" : "xbox");
++        nfsu2_tex_write_png(path, s_out, W, H);
++    }
++    return s_out;
++}
++
++static const uint32_t *provide(const Nv2aTexInfo *ti, uint32_t *k)
++{
++    size_t i;
++    int family;
++    if (ti->w != 32 || ti->h != 32)
++        return NULL;
++    nfsu2_prompts_poll();
++    family = s_mode >= 0 ? s_mode : s_family;
++    if (family == F_OFF)
++        return NULL;
++    for (i = 0; i < sizeof s_glyphs / sizeof s_glyphs[0]; i++)
++        if (s_glyphs[i].hash == ti->hash) {
++            if (family == F_XBOX && s_glyphs[i].kind <= G_Y)
++                return NULL;                            /* the game's own letters */
++            *k = K;
++            return draw(ti, s_glyphs[i].kind, family);
++        }
++    return NULL;
++}
++
++void nfsu2_prompts_init(void)
++{
++    const char *e = getenv("NFSU2_PROMPTS");
++    if (e && *e) {
++        if (!strcmp(e, "ps")) s_mode = F_PS;
++        else if (!strcmp(e, "xbox")) s_mode = F_XBOX;
++        else if (!strcmp(e, "0") || !strcmp(e, "off")) s_mode = F_OFF;
++    }
++    s_dump = getenv("NFSU2_PROMPTS_DUMP");
++    if (s_dump && !*s_dump) s_dump = NULL;
++    nfsu2_tex_add_provider(provide);
++}
+diff --git a/src/apple/apple_textures.h b/src/apple/apple_textures.h
+new file mode 100644
+index 0000000..dbb9c63
+--- /dev/null
++++ b/src/apple/apple_textures.h
+@@ -0,0 +1,15 @@
++/* Texture replacement on the Mac (apple_textures.m). */
++#ifndef APPLE_TEXTURES_H
++#define APPLE_TEXTURES_H
++#include <stdint.h>
++#include "../../xboxrecomp/src/kernel/nv2a_backend.h"
++
++typedef const uint32_t *(*nfsu2_tex_provider)(const Nv2aTexInfo *ti, uint32_t *k);
++void nfsu2_tex_init(void);
++void nfsu2_tex_add_provider(nfsu2_tex_provider p);
++void nfsu2_tex_write_png(const char *path, const uint32_t *argb, uint32_t w, uint32_t h);
++
++/* Button prompts for the connected pad (apple_prompts.m). */
++void nfsu2_prompts_init(void);
++void nfsu2_prompts_poll(void);
++#endif
+diff --git a/src/apple/apple_textures.m b/src/apple/apple_textures.m
+new file mode 100644
+index 0000000..b46c846
+--- /dev/null
++++ b/src/apple/apple_textures.m
+@@ -0,0 +1,100 @@
++/**
++ * Texture replacement for NFSU2 on the Mac (Deadware): the title side of
++ * nv2a_metal's nv2a_tex_replace_hook.
++ *
++ *   NFSU2_TEX_DUMP=<dir>   write every new 2D texture once as
++ *                          <hash>_<fmt>_<w>x<h>.png (finding hashes).
++ *
++ * Users of the hook register a provider (button prompts, HD packs); the
++ * first that answers wins.
++ */
++#import <CoreGraphics/CoreGraphics.h>
++#import <Foundation/Foundation.h>
++#import <ImageIO/ImageIO.h>
++
++#include <pthread.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <sys/stat.h>
++
++#include "../../xboxrecomp/src/kernel/nv2a_backend.h"
++#include "apple_textures.h"
++
++#define MAX_PROVIDERS 4
++static nfsu2_tex_provider s_prov[MAX_PROVIDERS];
++static int s_nprov;
++static const char *s_dump;
++static NSMutableSet<NSNumber *> *s_dumped;
++
++void nfsu2_tex_write_png(const char *path, const uint32_t *argb, uint32_t w, uint32_t h)
++{
++    /* A8R8G8B8 little endian = BGRA bytes, straight alpha. */
++    CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
++    CFDataRef data = CFDataCreate(NULL, (const UInt8 *)argb, (CFIndex)w * h * 4);
++    CGDataProviderRef dp = CGDataProviderCreateWithCFData(data);
++    CGImageRef img = CGImageCreate(w, h, 8, 32, w * 4, cs,
++        kCGImageAlphaFirst | kCGBitmapByteOrder32Little, dp, NULL, false,
++        kCGRenderingIntentDefault);
++    if (img) {
++        NSURL *u = [NSURL fileURLWithPath:[NSString stringWithUTF8String:path]];
++        CGImageDestinationRef d = CGImageDestinationCreateWithURL((__bridge CFURLRef)u,
++                                                                  CFSTR("public.png"), 1, NULL);
++        if (d) {
++            CGImageDestinationAddImage(d, img, NULL);
++            CGImageDestinationFinalize(d);
++            CFRelease(d);
++        }
++        CGImageRelease(img);
++    }
++    CGDataProviderRelease(dp);
++    CFRelease(data);
++    CGColorSpaceRelease(cs);
++}
++
++static const uint32_t *replace(const Nv2aTexInfo *ti, uint32_t *k)
++{
++    int i;
++    static int logged;
++    if (logged < 3 && getenv("NFSU2_TEX_TRACE")) {
++        logged++;
++        fprintf(stderr, "[tex] ask %016llx fmt %02x %ux%u\n", (unsigned long long)ti->hash,
++                ti->color, ti->w, ti->h);
++    }
++    if (s_dump) {
++        NSNumber *key = @(ti->hash);
++        if (![s_dumped containsObject:key]) {
++            char path[1024];
++            [s_dumped addObject:key];
++            snprintf(path, sizeof path, "%s/%016llx_%02x_%ux%u.png", s_dump,
++                     (unsigned long long)ti->hash, ti->color, ti->w, ti->h);
++            nfsu2_tex_write_png(path, ti->argb, ti->w, ti->h);
++        }
++    }
++    for (i = 0; i < s_nprov; i++) {
++        const uint32_t *px = s_prov[i](ti, k);
++        if (px)
++            return px;
++    }
++    return NULL;
++}
++
++void nfsu2_tex_add_provider(nfsu2_tex_provider p)
++{
++    if (s_nprov < MAX_PROVIDERS)
++        s_prov[s_nprov++] = p;
++    nv2a_tex_replace_hook = replace;
++}
++
++void nfsu2_tex_init(void)
++{
++    const char *d = getenv("NFSU2_TEX_DUMP");
++    if (d && *d) {
++        s_dump = strdup(d);
++        mkdir(s_dump, 0755);
++        s_dumped = [NSMutableSet new];
++        nv2a_tex_replace_hook = replace;
++        fprintf(stderr, "[tex] dumping new textures to %s\n", s_dump);
++    }
++    nfsu2_prompts_init();
++}
+diff --git a/src/main.c b/src/main.c
+index bb0c6f2..1205294 100644
+--- a/src/main.c
++++ b/src/main.c
+@@ -443,6 +443,9 @@ static int game_main(void)
+     xbox_kernel_init();
+     nfsu2_text_patch_init();
+     nfsu2_options_load();
++#if defined(__APPLE__) && defined(NFSU2_APPLE_TEXTURES)
++    { void nfsu2_tex_init(void); nfsu2_tex_init(); }
++#endif
+     xbox_path_init(game_dir, NFSU2_DEFAULT_SAVE_DIR);
+     xbox_kernel_bridge_init();
+ 
+diff --git a/xboxrecomp/src/kernel/nv2a_backend.h b/xboxrecomp/src/kernel/nv2a_backend.h
+index 8998673..5017881 100644
+--- a/xboxrecomp/src/kernel/nv2a_backend.h
++++ b/xboxrecomp/src/kernel/nv2a_backend.h
+@@ -189,6 +189,21 @@ void nv2a_backend_register(const Nv2aBackend *backend);
+  * Returns 0 if the format is not supported. */
+ int nv2a_backend_decode_texture(const Nv2aTexture *tex, uint32_t *argb_out);
+ 
++/* Texture replacement (title hook; Metal back end). Called when a swizzled
++ * or DXT 2D texture is uploaded. `hash` is a 64-bit FNV-1a of all its guest
++ * bytes (palette included), `argb` its decoded w x h pixels (A8R8G8B8).
++ * Return w*k x h*k A8R8G8B8 pixels (k >= 1, set *k) to draw instead, or
++ * NULL to keep the original. The pixels must stay valid until the next
++ * call. Bump nv2a_tex_replace_gen to have every texture asked again (e.g.
++ * when the pad family changes). */
++typedef struct {
++    uint32_t color, w, h, bytes;
++    uint64_t hash;
++    const uint32_t *argb;
++} Nv2aTexInfo;
++extern const uint32_t *(*nv2a_tex_replace_hook)(const Nv2aTexInfo *ti, uint32_t *k);
++extern volatile uint32_t nv2a_tex_replace_gen;
++
+ /* Where BACK_END_WRITE_SEMAPHORE_RELEASE (0x1D70) values land: the guest VA
+  * of the semaphore the title reads GPU progress from (for XDK D3D, the
+  * pointer at device+0x30). The executor writes each release there once it
+diff --git a/xboxrecomp/src/nv2a_metal/nv2a_metal.m b/xboxrecomp/src/nv2a_metal/nv2a_metal.m
+index 94677d7..389e379 100644
+--- a/xboxrecomp/src/nv2a_metal/nv2a_metal.m
++++ b/xboxrecomp/src/nv2a_metal/nv2a_metal.m
+@@ -548,8 +548,12 @@ static void surf_reset(MtSurf *s)
+     __strong id<MTLTexture> tex;
+     MTLPixelFormat fmt;
+     uint32_t used, checked;
++    uint32_t rgen, rk;          /* replacement generation asked, scale (0 = original) */
+ } MtTex;
+ 
++const uint32_t *(*nv2a_tex_replace_hook)(const Nv2aTexInfo *ti, uint32_t *k);
++volatile uint32_t nv2a_tex_replace_gen = 1;
++
+ #define MTL_MAX_TEX 1024
+ #define TEX_BUCKETS 2048
+ static MtTex    s_tex[MTL_MAX_TEX];
+@@ -662,6 +666,7 @@ static void tex_free(MtTex *t)
+     t->va = t->color = t->w = t->h = t->pitch = t->hash = t->bytes = t->face = 0;
+     t->fmt = MTLPixelFormatInvalid;
+     t->used = t->checked = 0;
++    t->rgen = t->rk = 0;
+ }
+ 
+ static void tex_account(MtTex *t, uint32_t bytes)
+@@ -779,6 +784,74 @@ static void tex_fill(MtTex *t, uint32_t va, uint32_t layer)
+     tex_upload(t, s_decode, w * h * 4, w * 4, h, layer);
+ }
+ 
++static uint64_t fnv64(const uint8_t *p, size_t n, uint64_t h)
++{
++    size_t i;
++    for (i = 0; i < n; i++)
++        h = (h ^ p[i]) * 0x100000001B3ull;
++    return h;
++}
++
++/* Asks the title's hook for a replacement of a 2D texture; on yes, t->tex is
++ * a BGRA8 texture k times larger with the replacement in it (rk = k). */
++static int tex_replace(MtTex *t, uint32_t va)
++{
++    const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
++    Nv2aTexInfo ti;
++    Nv2aTexture nt;
++    const uint32_t *px;
++    uint32_t k = 1, w = t->w, h = t->h;
++    id<MTLTexture> tex;
++    void *dst;
++    size_t at, bytes;
++
++    t->rgen = nv2a_tex_replace_gen;
++    t->rk = 0;
++    if (!nv2a_tex_replace_hook || t->face || (t->pitch && t->color != 0x0B))
++        return 0;
++    if ((size_t)w * h > s_decode_cap) {
++        free(s_decode);
++        s_decode_cap = (size_t)w * h;
++        s_decode = (uint32_t *)malloc(s_decode_cap * 4);
++    }
++    if (!s_decode)
++        return 0;
++    memset(&nt, 0, sizeof nt);
++    nt.offset = va; nt.width = w; nt.height = h; nt.color = t->color;
++    nt.addr_u = nt.addr_v = 1;
++    if (!(t->color == 0x0B ? decode_indexed(va, w, h, s_decode)
++                           : nv2a_backend_decode_texture(&nt, s_decode)))
++        return 0;
++    memset(&ti, 0, sizeof ti);
++    ti.color = t->color; ti.w = w; ti.h = h;
++    ti.bytes = tex_bytes(t->color, w, h, 0);
++    ti.hash = fnv64(mem + va, ti.bytes, 0xCBF29CE484222325ull);
++    if (t->color == 0x0B)
++        ti.hash = fnv64(mem + s_palette_va, 1024, ti.hash);
++    ti.argb = s_decode;
++    px = nv2a_tex_replace_hook(&ti, &k);
++    if (!px || k < 1 || k > 16)
++        return 0;
++    tex = make_texture(MTLTextureType2D, MTLPixelFormatBGRA8Unorm, w * k, h * k,
++                       MTLTextureUsageShaderRead);
++    if (!tex)
++        return 0;
++    bytes = (size_t)w * k * h * k * 4;
++    at = ring_alloc(bytes, 16, &dst);
++    if (!dst)
++        return 0;
++    memcpy(dst, px, bytes);
++    [blit() copyFromBuffer:s_f->ring sourceOffset:at sourceBytesPerRow:w * k * 4
++       sourceBytesPerImage:bytes sourceSize:MTLSizeMake(w * k, h * k, 1)
++                 toTexture:tex destinationSlice:0 destinationLevel:0
++         destinationOrigin:MTLOriginMake(0, 0, 0)];
++    t->tex = tex;
++    t->fmt = MTLPixelFormatBGRA8Unorm;
++    t->rk = k;
++    tex_account(t, (uint32_t)bytes);
++    return 1;
++}
++
+ /* face: bytes per cube face (cube_face_bytes), 0 for a 2D texture. */
+ static id<MTLTexture> tex_get(uint32_t va, uint32_t color, uint32_t w, uint32_t h, uint32_t pitch,
+                               uint32_t face)
+@@ -803,7 +876,7 @@ static void tex_fill(MtTex *t, uint32_t va, uint32_t layer)
+     hash = bytes_hash(va, face ? face * 6 : tex_bytes(color, w, h, pitch));
+     if (color == 0x0B)
+         hash ^= bytes_hash(s_palette_va, 1024) * 31u;
+-    if (t && t->hash == hash) {
++    if (t && t->hash == hash && t->rgen == nv2a_tex_replace_gen) {
+         t->used = t->checked = s_frame;
+         return t->tex;
+     }
+@@ -818,7 +891,7 @@ static void tex_fill(MtTex *t, uint32_t va, uint32_t layer)
+     if (s_have_bc && color == 0x0C) fmt = MTLPixelFormatBC1_RGBA;
+     if (s_have_bc && color == 0x0E) fmt = MTLPixelFormatBC2_RGBA;
+     if (s_have_bc && color == 0x0F) fmt = MTLPixelFormatBC3_RGBA;
+-    if (t && (t->fmt != fmt || t->pitch != pitch)) {
++    if (t && (t->fmt != fmt || t->pitch != pitch || t->rk)) {
+         tex_free(t);
+         t = NULL;
+     }
+@@ -849,6 +922,10 @@ static void tex_fill(MtTex *t, uint32_t va, uint32_t layer)
+     }
+     t->hash = hash;
+     t->used = t->checked = s_frame;
++    if (tex_replace(t, va)) {
++        s_hz_tex_ns += hz_now() - upload_start;
++        return t->tex;
++    }
+ 
+     for (f = 0; f < layers; f++)
+         tex_fill(t, va + f * face, f);

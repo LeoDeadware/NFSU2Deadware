@@ -1,0 +1,213 @@
+From b1b69699dbfcc836ae21e66832e88ffb42aed32c Mon Sep 17 00:00:00 2001
+From: LeoDeadware <351117497+LeoDeadware@users.noreply.github.com>
+Date: Sat, 7 Nov 2026 11:10:20 +0200
+Subject: [PATCH 08/24] nv2a_metal post: stable SSAO (fixed 4x4 pattern +
+ depth-aware 4x4 blur, distance fade, bright pixels kept), scene test
+ hysteresis + fade-in
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ xboxrecomp/src/nv2a_metal/nv2a_metal_post.inc | 83 ++++++++++++++-----
+ 1 file changed, 64 insertions(+), 19 deletions(-)
+
+diff --git a/xboxrecomp/src/nv2a_metal/nv2a_metal_post.inc b/xboxrecomp/src/nv2a_metal/nv2a_metal_post.inc
+index 2702da7..85548f0 100644
+--- a/xboxrecomp/src/nv2a_metal/nv2a_metal_post.inc
++++ b/xboxrecomp/src/nv2a_metal/nv2a_metal_post.inc
+@@ -23,22 +23,33 @@
+  * camera's near/far (NFSU2_AO_NEAR/FAR, default 0.5 / 10000), compared with
+  * the plane fitted through the pixel's neighbours so flat road and walls at
+  * a grazing angle do not darken themselves; 12 samples at half resolution,
+- * rotated per pixel, then a depth-aware 3x3 blur in the composite.
++ * rotated by a fixed 4x4 interleaved pattern (the same every frame: white
++ * noise crawled over the textures as the camera moved), then a depth-aware
++ * 4x4 blur that spans exactly that pattern, so no grain is left. AO fades
++ * out with distance (NFSU2_AO_FADE metres, default 60) and leaves bright,
++ * emissive pixels alone (lights, neon, sky glow), so it darkens creases and
++ * contact shadows, not the textures' own colours.
++ * Stability: the scene test has hysteresis (enter at 150 depth-tested draws,
++ * stay at 60, leave after 30 frames without a scene) and the effects fade
++ * in over 20 frames, so 3D menus and camera sequences no longer switch AO
++ * on and off between frames.
+  */
+ 
+ static int   s_post_init_done;
+ static int   s_gamma_on, s_ao_on, s_post_debug;
+ static float s_bloom_k;
+ /* s_gamma_v (exponent, tint rgb), s_present_pipe: declared in nv2a_metal.m */
+-static float s_ao_near = 0.5f, s_ao_far = 10000.0f;
++static float s_ao_near = 0.5f, s_ao_far = 10000.0f, s_ao_fade_m = 60.0f;
+ 
+-static id<MTLRenderPipelineState> s_ao_pipe, s_bright_pipe, s_blur_pipe, s_comp_pipe;
+-static id<MTLTexture> s_post_src, s_post_ao, s_post_b0, s_post_b1;
++static id<MTLRenderPipelineState> s_ao_pipe, s_aoblur_pipe, s_bright_pipe, s_blur_pipe, s_comp_pipe;
++static id<MTLTexture> s_post_src, s_post_ao, s_post_ao2, s_post_b0, s_post_b1;
+ 
+ static MtSurf  *s_scene;
+ static MtDepth *s_scene_d;
+ static uint32_t s_scene_draws, s_post_pw, s_post_runs, s_post_frames;
+ static int      s_post_done;
++static int      s_post_active, s_post_idle;    /* hysteresis: in a 3D scene; frames without one */
++static float    s_post_fade;                   /* 0..1, effects fade in */
+ 
+ static const char *post_msl(void)
+ {
+@@ -58,7 +69,7 @@ static const char *post_msl(void)
+         "    c.rgb = pow(max(c.rgb, 0.0), float3(g.x)) * g.yzw;\n"
+         "    return c;\n"
+         "}\n"
+-        "struct PostP { float near_, far_, w, h, strength, radius, debug, bloom; };\n"
++        "struct PostP { float near_, far_, w, h, strength, radius, debug, bloom, fade_m, k; };\n"
+         "static float lin(float z, constant PostP& p) {\n"
+         "    return p.near_ / max(1.0 - z * (1.0 - p.near_ / p.far_), 1e-6);\n"
+         "}\n"
+@@ -78,7 +89,10 @@ static const char *post_msl(void)
+         "    float gx = abs(z - zl) < abs(zrr - z) ? z - zl : zrr - z;\n"
+         "    float gy = abs(z - zu) < abs(zd - z) ? z - zu : zd - z;\n"
+         "    float rpx = clamp(p.radius * p.h / z, 3.0, p.h * 0.06);\n"
+-        "    float a0 = fract(sin(dot(float2(c), float2(12.9898, 78.233))) * 43758.5453) * 6.2832;\n"
++        "    if (z > p.fade_m) return 1.0;\n"                       /* far: no AO (precision, shimmer) */
++        "    uint2 b = uint2(in.pos.xy) & 3u;\n"                    /* 4x4 interleaved, fixed in time */
++        "    const float bay[16] = { 0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5 };\n"
++        "    float a0 = (bay[b.y * 4 + b.x] + 0.5) / 16.0 * 6.2832;\n"
+         "    float occ = 0.0;\n"
+         "    for (int i = 0; i < 12; i++) {\n"
+         "        float t = (float(i) + 0.5) / 12.0;\n"
+@@ -92,7 +106,23 @@ static const char *post_msl(void)
+         "        float eps = z * 0.004 + 0.02;\n"
+         "        occ += step(eps, diff) * saturate(1.0 - (diff - eps) / range);\n"
+         "    }\n"
+-        "    return saturate(1.0 - p.strength * occ / 12.0);\n"
++        "    float fade = 1.0 - smoothstep(p.fade_m * 0.5, p.fade_m, z);\n"
++        "    return saturate(1.0 - p.strength * fade * occ / 12.0);\n"
++        "}\n"
++        /* depth-aware 4x4 blur over the pattern's period, at half resolution */
++        "fragment float aoblur_fs(QOut in [[stage_in]], texture2d<float> ao [[texture(0)]],\n"
++        "                         depth2d<float> d [[texture(1)]], constant PostP& p [[buffer(0)]]) {\n"
++        "    int2 h = int2(in.pos.xy);\n"
++        "    int2 hw = int2(ao.get_width(), ao.get_height());\n"
++        "    float z0 = ld(d, h * 2 + 1, p);\n"
++        "    float acc = 0.0, wsum = 0.0;\n"
++        "    for (int j = -2; j < 2; j++) for (int i = -2; i < 2; i++) {\n"
++        "        int2 q = clamp(h + int2(i, j), int2(0), hw - 1);\n"
++        "        float zq = ld(d, q * 2 + 1, p);\n"
++        "        float w = saturate(1.0 - abs(zq - z0) / (z0 * 0.05 + 0.1));\n"
++        "        acc += ao.read(uint2(q)).r * w; wsum += w;\n"
++        "    }\n"
++        "    return wsum > 0.0 ? acc / wsum : 1.0;\n"
+         "}\n"
+         /* bloom: bright, saturated (emissive) pixels at a quarter of the size */
+         "fragment float4 bright_fs(QOut in [[stage_in]], texture2d<float> t [[texture(0)]],\n"
+@@ -122,13 +152,12 @@ static const char *post_msl(void)
+         "                        texture2d<float> ao [[texture(1)]], texture2d<float> bl [[texture(2)]],\n"
+         "                        sampler s [[sampler(0)]], constant PostP& p [[buffer(0)]]) {\n"
+         "    float4 c = src.sample(s, in.uv);\n"
+-        "    float2 px = 1.0 / float2(ao.get_width(), ao.get_height());\n"
+-        "    float v = 0.0;\n"
+-        "    for (int j = -1; j <= 1; j++) for (int i = -1; i <= 1; i++)\n"
+-        "        v += ao.sample(s, in.uv + float2(i, j) * px).r;\n"
+-        "    v /= 9.0;\n"
++        "    float v = ao.sample(s, in.uv).r;\n"
+         "    if (p.debug > 0.5) return float4(v, v, v, c.a);\n"
+-        "    c.rgb = c.rgb * v + bl.sample(s, in.uv).rgb * p.bloom;\n"
++        "    float l = dot(c.rgb, float3(0.299, 0.587, 0.114));\n"
++        "    float keep = smoothstep(0.55, 0.9, l);\n"            /* lit / emissive: leave alone */
++        "    v = mix(1.0, v, p.k * (1.0 - keep));\n"
++        "    c.rgb = c.rgb * v + bl.sample(s, in.uv).rgb * p.bloom * p.k;\n"
+         "    return c;\n"
+         "}\n";
+ }
+@@ -156,6 +185,7 @@ static void post_settings(void)
+     s_post_debug = e && *e == '1';
+     if ((e = getenv("NFSU2_AO_NEAR"))) s_ao_near = (float)atof(e);
+     if ((e = getenv("NFSU2_AO_FAR"))) s_ao_far = (float)atof(e);
++    if ((e = getenv("NFSU2_AO_FADE"))) s_ao_fade_m = (float)atof(e);
+     fprintf(stderr, "[post] gamma %s, ambient occlusion %s, bloom %.2f%s\n",
+             s_gamma_v[0] == 1.0f ? "original" : s_gamma_v[0] < 1.0f ? "modern" : "warm",
+             s_ao_on ? "on" : "off", s_bloom_k, s_post_debug ? " (debug: occlusion only)" : "");
+@@ -169,6 +199,7 @@ static int post_shaders(void)
+     struct { const char *fs; MTLPixelFormat fmt; id<MTLRenderPipelineState> __strong *out; } P[] = {
+         { "present_fs", MTLPixelFormatBGRA8Unorm, &s_present_pipe },
+         { "ao_fs", MTLPixelFormatR8Unorm, &s_ao_pipe },
++        { "aoblur_fs", MTLPixelFormatR8Unorm, &s_aoblur_pipe },
+         { "bright_fs", MTLPixelFormatRGBA16Float, &s_bright_pipe },
+         { "blur_fs", MTLPixelFormatRGBA16Float, &s_blur_pipe },
+         { "comp_fs", MTLPixelFormatBGRA8Unorm, &s_comp_pipe },
+@@ -225,7 +256,7 @@ static id<MTLTexture> post_tex(id<MTLTexture> t, MTLPixelFormat f, uint32_t w, u
+ 
+ static void post_run(MtSurf *s, MtDepth *d)
+ {
+-    struct { float near_, far_, w, h, strength, radius, debug, bloom; } p;
++    struct { float near_, far_, w, h, strength, radius, debug, bloom, fade_m, k; } p;
+     id<MTLTexture> t[3];
+     uint32_t qw = s->pw / 4, qh = s->ph / 4;
+     int ao = s_ao_on && d && d->pw == s->pw && d->ph == s->ph;
+@@ -234,27 +265,32 @@ static void post_run(MtSurf *s, MtDepth *d)
+     end_blit();
+     s_post_src = post_tex(s_post_src, MTLPixelFormatBGRA8Unorm, s->pw, s->ph);
+     s_post_ao = post_tex(s_post_ao, MTLPixelFormatR8Unorm, s->pw / 2, s->ph / 2);
++    s_post_ao2 = post_tex(s_post_ao2, MTLPixelFormatR8Unorm, s->pw / 2, s->ph / 2);
+     s_post_b0 = post_tex(s_post_b0, MTLPixelFormatRGBA16Float, qw, qh);
+     s_post_b1 = post_tex(s_post_b1, MTLPixelFormatRGBA16Float, qw, qh);
+-    if (!s_post_src || !s_post_ao || !s_post_b0 || !s_post_b1)
++    if (!s_post_src || !s_post_ao || !s_post_ao2 || !s_post_b0 || !s_post_b1)
+         return;
+     [blit() copyFromTexture:s->tex toTexture:s_post_src];
+     end_blit();
+ 
+     p.near_ = s_ao_near; p.far_ = s_ao_far;
+     p.w = (float)s->pw; p.h = (float)s->ph;
+-    p.strength = ao ? 1.2f : 0.0f;
++    p.strength = ao ? 0.9f : 0.0f;
++    p.fade_m = s_ao_fade_m;
++    p.k = s_post_fade;
+     p.radius = 1.0f;                  /* world units (the game's metres) */
+     p.debug = s_post_debug ? 1.0f : 0.0f;
+     p.bloom = s_bloom_k;
+     if (ao) {
+         t[0] = d->tex;
+         post_pass(s_post_ao, s_ao_pipe, t, 1, &p, sizeof p, NULL, 0);
++        t[0] = s_post_ao; t[1] = d->tex;
++        post_pass(s_post_ao2, s_aoblur_pipe, t, 2, &p, sizeof p, NULL, 0);
+     } else {
+         float one[4] = { 1, 1, 1, 1 };   /* AO texture cleared to 1 by a gamma-less copy of white */
+         (void)one;
+         MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+-        rp.colorAttachments[0].texture = s_post_ao;
++        rp.colorAttachments[0].texture = s_post_ao2;
+         rp.colorAttachments[0].loadAction = MTLLoadActionClear;
+         rp.colorAttachments[0].clearColor = MTLClearColorMake(1, 1, 1, 1);
+         rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+@@ -277,7 +313,7 @@ static void post_run(MtSurf *s, MtDepth *d)
+         rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+         [[s_cb renderCommandEncoderWithDescriptor:rp] endEncoding];
+     }
+-    t[0] = s_post_src; t[1] = s_post_ao; t[2] = s_post_b0;
++    t[0] = s_post_src; t[1] = s_post_ao2; t[2] = s_post_b0;
+     post_pass(s->tex, s_comp_pipe, t, 3, &p, sizeof p, NULL, 0);
+     s->gen++;
+     s_post_runs++;
+@@ -298,7 +334,11 @@ static void post_scene_hook(MtSurf *s, MtDepth *d, const uint32_t *r)
+         }
+         return;
+     }
+-    if (s_scene && s_scene_draws >= 150) {
++    if (s_scene && s_scene_draws >= (s_post_active ? 60u : 150u)) {
++        if (!s_post_active)
++            s_post_fade = 0.0f;
++        s_post_active = 1;
++        s_post_idle = 0;
+         post_run(s_scene, s_scene_d);
+         s_post_done = 1;
+     }
+@@ -312,5 +352,10 @@ static void post_frame(MtSurf *presented)
+         fprintf(stderr, "[post] scene effects ran in %u of the last 600 frames\n", s_post_runs),
+         s_post_runs = 0;
+     s_post_pw = presented ? presented->pw : 0;
++    if (s_post_done) {
++        s_post_fade = s_post_fade + 0.05f > 1.0f ? 1.0f : s_post_fade + 0.05f;
++    } else if (s_post_active && ++s_post_idle > 30) {
++        s_post_active = 0;
++    }
+     s_scene = NULL; s_scene_d = NULL; s_scene_draws = 0; s_post_done = 0;
+ }

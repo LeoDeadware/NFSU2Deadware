@@ -1,0 +1,227 @@
+From 33973ede893b4bf20929e90ed1a758feef661218 Mon Sep 17 00:00:00 2001
+From: LeoDeadware <351117497+LeoDeadware@users.noreply.github.com>
+Date: Fri, 6 Nov 2026 23:27:50 +0200
+Subject: [PATCH 05/24] HD textures: pack loader (Resources/hd, NFSU2_HD),
+ mipmapped replacements, ui/world dump names
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/apple/apple_textures.m             | 111 ++++++++++++++++++++++++-
+ xboxrecomp/src/kernel/nv2a_backend.h   |   1 +
+ xboxrecomp/src/nv2a_metal/nv2a_metal.m |  19 ++++-
+ 3 files changed, 123 insertions(+), 8 deletions(-)
+
+diff --git a/src/apple/apple_textures.m b/src/apple/apple_textures.m
+index b46c846..b3db8e5 100644
+--- a/src/apple/apple_textures.m
++++ b/src/apple/apple_textures.m
+@@ -3,7 +3,11 @@
+  * nv2a_metal's nv2a_tex_replace_hook.
+  *
+  *   NFSU2_TEX_DUMP=<dir>   write every new 2D texture once as
+- *                          <hash>_<fmt>_<w>x<h>.png (finding hashes).
++ *                          <hash>_<fmt>_<w>x<h>_<ui|world>.png (finding
++ *                          hashes; tools/hd/census.sh).
++ *   NFSU2_HD=<dir>|0       the HD pack (tools/hd/build_pack.py: <hash>.png +
++ *                          manifest.tsv); default <app>/Contents/Resources/hd
++ *                          when it exists. Pictures load on first use.
+  *
+  * Users of the hook register a provider (button prompts, HD packs); the
+  * first that answers wins.
+@@ -12,6 +16,8 @@
+ #import <Foundation/Foundation.h>
+ #import <ImageIO/ImageIO.h>
+ 
++#include <limits.h>
++#include <mach-o/dyld.h>
+ #include <pthread.h>
+ #include <stdio.h>
+ #include <stdlib.h>
+@@ -52,6 +58,101 @@ void nfsu2_tex_write_png(const char *path, const uint32_t *argb, uint32_t w, uin
+     CGColorSpaceRelease(cs);
+ }
+ 
++/* ── HD pack ── */
++static NSDictionary<NSNumber *, NSString *> *s_hd;       /* hash -> png path */
++static uint32_t *s_px;
++static size_t s_px_cap;
++static unsigned long s_hd_hits, s_hd_fail;
++
++static const uint32_t *hd_provide(const Nv2aTexInfo *ti, uint32_t *k)
++{
++    NSString *path = s_hd[@(ti->hash)];
++    CGImageSourceRef src;
++    CGImageRef img;
++    size_t W, H, i;
++    uint32_t kk;
++    if (!path)
++        return NULL;
++    src = CGImageSourceCreateWithURL((__bridge CFURLRef)[NSURL fileURLWithPath:path], NULL);
++    img = src ? CGImageSourceCreateImageAtIndex(src, 0, NULL) : NULL;
++    if (src) CFRelease(src);
++    if (!img) { s_hd_fail++; return NULL; }
++    W = CGImageGetWidth(img); H = CGImageGetHeight(img);
++    kk = (uint32_t)(W / ti->w);
++    if (kk < 1 || W != ti->w * kk || H != ti->h * kk) {
++        CGImageRelease(img);
++        s_hd_fail++;
++        return NULL;
++    }
++    if (W * H > s_px_cap) {
++        free(s_px);
++        s_px_cap = W * H;
++        s_px = (uint32_t *)malloc(s_px_cap * 4);
++    }
++    {
++        CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
++        CGContextRef c = CGBitmapContextCreate(s_px, W, H, 8, W * 4, cs,
++            kCGImageAlphaPremultipliedFirst | kCGBitmapByteOrder32Little);
++        CGColorSpaceRelease(cs);
++        if (!c) { CGImageRelease(img); s_hd_fail++; return NULL; }
++        CGContextSetBlendMode(c, kCGBlendModeCopy);
++        CGContextDrawImage(c, CGRectMake(0, 0, W, H), img);
++        CGContextRelease(c);
++    }
++    CGImageRelease(img);
++    for (i = 0; i < W * H; i++) {                      /* straight alpha again */
++        uint32_t p = s_px[i], a = p >> 24;
++        if (a && a < 255) {
++            uint32_t r = ((p >> 16 & 255) * 255 + a / 2) / a, g = ((p >> 8 & 255) * 255 + a / 2) / a,
++                     b = ((p & 255) * 255 + a / 2) / a;
++            s_px[i] = a << 24 | (r > 255 ? 255 : r) << 16 | (g > 255 ? 255 : g) << 8 | (b > 255 ? 255 : b);
++        }
++    }
++    if (!s_hd_hits++)
++        fprintf(stderr, "[hd] first HD texture %016llx %ux%u -> %zux%zu\n",
++                (unsigned long long)ti->hash, ti->w, ti->h, W, H);
++    *k = kk;
++    return s_px;
++}
++
++static void hd_init(void)
++{
++    const char *e = getenv("NFSU2_HD");
++    NSString *dir = nil, *man;
++    NSMutableDictionary *idx = [NSMutableDictionary new];
++    if (e && (!strcmp(e, "0") || !*e))
++        return;
++    if (e)
++        dir = [NSString stringWithUTF8String:e];
++    else {
++        char buf[4096], real[PATH_MAX];
++        uint32_t n = sizeof buf;
++        NSString *exe, *res;
++        if (_NSGetExecutablePath(buf, &n) != 0 || !realpath(buf, real))
++            return;
++        exe = [NSString stringWithUTF8String:real];
++        res = [[exe stringByDeletingLastPathComponent] stringByAppendingPathComponent:@"../Resources/hd"];
++        dir = [res stringByStandardizingPath];
++    }
++    man = [NSString stringWithContentsOfFile:[dir stringByAppendingPathComponent:@"manifest.tsv"]
++                                    encoding:NSUTF8StringEncoding error:nil];
++    if (!man)
++        return;
++    for (NSString *line in [man componentsSeparatedByString:@"\n"]) {
++        NSArray *f = [line componentsSeparatedByString:@"\t"];
++        unsigned long long h;
++        if (line.length < 16 || [line hasPrefix:@"#"] || f.count < 2)
++            continue;
++        h = strtoull([f[0] UTF8String], NULL, 16);
++        idx[@(h)] = [dir stringByAppendingPathComponent:[f[0] stringByAppendingString:@".png"]];
++    }
++    s_hd = idx;
++    if (!getenv("RECOMP_GL_TEX_MB"))
++        setenv("RECOMP_GL_TEX_MB", "1536", 1);
++    nfsu2_tex_add_provider(hd_provide);
++    fprintf(stderr, "[hd] %lu HD textures in %s\n", (unsigned long)idx.count, dir.UTF8String);
++}
++
+ static const uint32_t *replace(const Nv2aTexInfo *ti, uint32_t *k)
+ {
+     int i;
+@@ -66,8 +167,9 @@ void nfsu2_tex_write_png(const char *path, const uint32_t *argb, uint32_t w, uin
+         if (![s_dumped containsObject:key]) {
+             char path[1024];
+             [s_dumped addObject:key];
+-            snprintf(path, sizeof path, "%s/%016llx_%02x_%ux%u.png", s_dump,
+-                     (unsigned long long)ti->hash, ti->color, ti->w, ti->h);
++            snprintf(path, sizeof path, "%s/%016llx_%02x_%ux%u_%s.png", s_dump,
++                     (unsigned long long)ti->hash, ti->color, ti->w, ti->h,
++                     ti->flat ? "ui" : "world");
+             nfsu2_tex_write_png(path, ti->argb, ti->w, ti->h);
+         }
+     }
+@@ -96,5 +198,6 @@ void nfsu2_tex_init(void)
+         nv2a_tex_replace_hook = replace;
+         fprintf(stderr, "[tex] dumping new textures to %s\n", s_dump);
+     }
+-    nfsu2_prompts_init();
++    nfsu2_prompts_init();          /* first: its glyphs win over the pack */
++    hd_init();
+ }
+diff --git a/xboxrecomp/src/kernel/nv2a_backend.h b/xboxrecomp/src/kernel/nv2a_backend.h
+index 5017881..7eb3502 100644
+--- a/xboxrecomp/src/kernel/nv2a_backend.h
++++ b/xboxrecomp/src/kernel/nv2a_backend.h
+@@ -198,6 +198,7 @@ int nv2a_backend_decode_texture(const Nv2aTexture *tex, uint32_t *argb_out);
+  * when the pad family changes). */
+ typedef struct {
+     uint32_t color, w, h, bytes;
++    uint32_t flat;              /* first used by a draw with the depth test off (2D) */
+     uint64_t hash;
+     const uint32_t *argb;
+ } Nv2aTexInfo;
+diff --git a/xboxrecomp/src/nv2a_metal/nv2a_metal.m b/xboxrecomp/src/nv2a_metal/nv2a_metal.m
+index 389e379..ed7d3dd 100644
+--- a/xboxrecomp/src/nv2a_metal/nv2a_metal.m
++++ b/xboxrecomp/src/nv2a_metal/nv2a_metal.m
+@@ -824,6 +824,7 @@ static int tex_replace(MtTex *t, uint32_t va)
+         return 0;
+     memset(&ti, 0, sizeof ti);
+     ti.color = t->color; ti.w = w; ti.h = h;
++    ti.flat = s_batch && !s_batch->regs[0x30C / 4];
+     ti.bytes = tex_bytes(t->color, w, h, 0);
+     ti.hash = fnv64(mem + va, ti.bytes, 0xCBF29CE484222325ull);
+     if (t->color == 0x0B)
+@@ -832,8 +833,15 @@ static int tex_replace(MtTex *t, uint32_t va)
+     px = nv2a_tex_replace_hook(&ti, &k);
+     if (!px || k < 1 || k > 16)
+         return 0;
+-    tex = make_texture(MTLTextureType2D, MTLPixelFormatBGRA8Unorm, w * k, h * k,
+-                       MTLTextureUsageShaderRead);
++    {
++        /* With mips (PIT-H03: a larger picture without them shimmers). */
++        MTLTextureDescriptor *td = [MTLTextureDescriptor
++            texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm width:w * k height:h * k
++                                     mipmapped:YES];
++        td.usage = MTLTextureUsageShaderRead;
++        td.storageMode = MTLStorageModePrivate;
++        tex = [s_dev newTextureWithDescriptor:td];
++    }
+     if (!tex)
+         return 0;
+     bytes = (size_t)w * k * h * k * 4;
+@@ -845,10 +853,12 @@ static int tex_replace(MtTex *t, uint32_t va)
+        sourceBytesPerImage:bytes sourceSize:MTLSizeMake(w * k, h * k, 1)
+                  toTexture:tex destinationSlice:0 destinationLevel:0
+          destinationOrigin:MTLOriginMake(0, 0, 0)];
++    if (tex.mipmapLevelCount > 1)
++        [blit() generateMipmapsForTexture:tex];
+     t->tex = tex;
+     t->fmt = MTLPixelFormatBGRA8Unorm;
+     t->rk = k;
+-    tex_account(t, (uint32_t)bytes);
++    tex_account(t, (uint32_t)(bytes * 4 / 3));
+     return 1;
+ }
+ 
+@@ -1132,7 +1142,8 @@ static MTLSamplerAddressMode wrap_mode(uint32_t m)
+     d.rAddressMode = MTLSamplerAddressModeRepeat;
+     d.magFilter = (key & 0x10000) ? MTLSamplerMinMagFilterNearest : MTLSamplerMinMagFilterLinear;
+     d.minFilter = (key & 0x20000) ? MTLSamplerMinMagFilterNearest : MTLSamplerMinMagFilterLinear;
+-    d.mipFilter = MTLSamplerMipFilterNotMipmapped;
++    /* Only replaced (HD) textures have mips; the game's own have one level. */
++    d.mipFilter = MTLSamplerMipFilterLinear;
+     if (s_nsamplers == 64)
+         s_nsamplers = 0;                        /* never in practice: 4 x 4 x 4 keys */
+     s_samplers[s_nsamplers].key = key;

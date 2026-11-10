@@ -1,0 +1,8 @@
+# Reviewed per-pack match settings (contact sheets, 2026-11-07). community.py match TAG reads its row:
+# tag	pc_dir (relative to .cache/community, - = TAG/files)	tpfmatch options	skip (Xbox hashes rejected by eye, comma-separated)
+remaster23	-	--thr 0.16	-
+redux13	-	--thr 0.17	cd7efcbe6f37a2ea
+nextgen31	-	--thr 0.09	-
+revit90	revit90/files	--thr 0.11	-
+sky61	sky61/sky	--thr 0.42 --rev 9	-
+smoke24	src24/setup_files/INGAMECOMMON/RETEXTURE	--thr 0.33	-

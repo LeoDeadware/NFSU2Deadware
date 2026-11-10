@@ -1,0 +1,273 @@
+From 69272446bc3f095fd60e96c3264a1c008da564e7 Mon Sep 17 00:00:00 2001
+From: LeoDeadware <351117497+LeoDeadware@users.noreply.github.com>
+Date: Sat, 7 Nov 2026 16:00:22 +0200
+Subject: [PATCH 11/24] present pacing: display sync + 1/60 min duration, 60.00
+ Hz vblank phase-locked to the display (+9 ms), [present] presentedTime stats;
+ front end fitted whole (pillarbox), draw distance and offscreen scale 1.0
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/recomp_manual.c                    |   7 +-
+ xboxrecomp/src/kernel/kernel_bridge.c  |  21 ++++
+ xboxrecomp/src/nv2a_metal/nv2a_metal.m | 138 +++++++++++++++++++++++--
+ 3 files changed, 156 insertions(+), 10 deletions(-)
+
+diff --git a/src/recomp_manual.c b/src/recomp_manual.c
+index 7c226cc..f00ffef 100644
+--- a/src/recomp_manual.c
++++ b/src/recomp_manual.c
+@@ -1108,7 +1108,8 @@ static int32_t sphere_fade(uint32_t obj, uint32_t p, float r, int *pcmp, uint16_
+  * sizes pick the finer model (+0x30/+0x34/+0x38 of the instance's model
+  * set; sub_001C69C0 0x1C6AC2-0x1C6B78). We render at 2-4x that resolution,
+  * so those cut-offs fall at a few real pixels. NFSU2_DRAW_DISTANCE=<f>
+- * (0.5..8, default 2) multiplies the size the drawer sees: objects stay
++ * (0.5..8, default 1: x2 spiked the GPU past 16.7 ms late in a race,
++ * owner 2026-11-07 "залізні 60 fps") multiplies the size the drawer sees: objects stay
+  * drawn and keep their finer model f times as far. 1 = the original. Not
+  * applied in the RECOMP_NATIVE_CHECK=1 comparison mode. */
+ static float draw_distance(void)
+@@ -1116,9 +1117,9 @@ static float draw_distance(void)
+     static float f = -1.0f;
+     if (f < 0.0f) {
+         const char *e = getenv("NFSU2_DRAW_DISTANCE");
+-        f = e ? (float)atof(e) : 2.0f;
++        f = e ? (float)atof(e) : 1.0f;
+         if (!(f >= 0.5f && f <= 8.0f))
+-            f = 2.0f;
++            f = 1.0f;
+         fprintf(stderr, "[draw] scenery draw distance x%.2f%s\n", f, f == 1.0f ? " (original)" : "");
+     }
+     return f;
+diff --git a/xboxrecomp/src/kernel/kernel_bridge.c b/xboxrecomp/src/kernel/kernel_bridge.c
+index 8ce76b3..512f4d1 100644
+--- a/xboxrecomp/src/kernel/kernel_bridge.c
++++ b/xboxrecomp/src/kernel/kernel_bridge.c
+@@ -2890,6 +2890,18 @@ static long long vblank_period_us(void)
+     if (!p) {
+         const char *e = getenv("RECOMP_VBLANK_HZ");
+         p = e && atoi(e) == 120 ? VBLANK_PERIOD_60_US / 2 : VBLANK_PERIOD_60_US;
++        /* Presenting with display sync (NFSU2_PRESENT, default): the vblank
++         * runs at the display's 60.00 Hz and is phase-locked to it
++         * (xbox_vblank_nudge); a 59.94 Hz one repeats a frame on screen
++         * every 16.7 s. */
++        {
++            const char *m = getenv("NFSU2_PRESENT");
++            if (!m || strcmp(m, "free"))
++                p = p == VBLANK_PERIOD_60_US ? 16667 : 8333;
++        }
++        e = getenv("RECOMP_VBLANK_US");           /* display-pacing experiments */
++        if (e && atoi(e) >= 4000 && atoi(e) <= 40000)
++            p = atoi(e);
+     }
+     return p;
+ }
+@@ -2906,6 +2918,15 @@ static long long vb_now_us(void)
+ }
+ 
+ static long long     s_vb_next_us;                /* when the next vblank is due */
++/* Display phase lock (nv2a_metal.m present pacing): moves the next vblank by
++ * us (positive = later) so the game's frames land at a fixed phase of the
++ * display's refresh; small steps, called once per presented frame. */
++void xbox_vblank_nudge(long long us)
++{
++    __atomic_fetch_add(&s_vb_next_us, us, __ATOMIC_RELAXED);
++}
++long long xbox_vblank_period_us(void) { return VBLANK_PERIOD_US; }
++long long xbox_vblank_next_us(void) { return __atomic_load_n(&s_vb_next_us, __ATOMIC_RELAXED); }
+ static volatile LONG s_vb_count;                  /* vblanks delivered */
+ 
+ /* For the fps reports: "vblank 59.9 Hz" since the previous call, dt s ago. */
+diff --git a/xboxrecomp/src/nv2a_metal/nv2a_metal.m b/xboxrecomp/src/nv2a_metal/nv2a_metal.m
+index 37b7027..46ee5ca 100644
+--- a/xboxrecomp/src/nv2a_metal/nv2a_metal.m
++++ b/xboxrecomp/src/nv2a_metal/nv2a_metal.m
+@@ -130,7 +130,61 @@ static uint64_t hz_now(void)
+ #define FT_BINS 1000
+ typedef struct { uint32_t hist[FT_BINS + 1]; uint32_t n, missed, dropped, over; double max; } FtStat;
+ static pthread_mutex_t s_ft_lock = PTHREAD_MUTEX_INITIALIZER;
+-static FtStat s_ft_gpu, s_ft_flip, s_ft_ready;
++static FtStat s_ft_gpu, s_ft_flip, s_ft_ready, s_ft_pres;
++/* Present pacing (NFSU2_PRESENT): "free" = no display sync (the old path:
++ * drawables carry no presentedTime, the compositor shows each frame on
++ * whatever refresh it lands, beating against the 59.94 Hz emulated vblank),
++ * "sync" = display sync, "min" (default) = display sync + every drawable held
++ * at least 1/60 s, so a 120 Hz panel shows each game frame for two refreshes.
++ * "[present]" (RECOMP_FPS_LOG=1) = intervals between the frames' real
++ * presentedTime: what reaches the screen (unique frames/s, repeats > 25 ms,
++ * frames never shown). */
++static int s_pres_mode = -1;       /* 0 free, 1 sync, 2 min */
++/* Phase lock: each presented frame is on the display's 60 Hz grid; the
++ * emulated vblank (= the game's flip) is steered to grid + NFSU2_PRESENT_PHASE
++ * us (default 9000, measured 2026-11-07 in races: 0 frames repeated on
++ * screen; 1000 repeated one when a frame's GPU time passed 16.7 ms; no lock:
++ * one per 10 s from clock drift). NFSU2_PRESENT_LOCK=0 turns it off. */
++static long long s_pres_phase = -1;
++static double s_pres_err_sum, s_pres_err_max;
++static uint32_t s_pres_err_n;
++extern void xbox_vblank_nudge(long long us);
++extern long long xbox_vblank_period_us(void);
++extern long long xbox_vblank_next_us(void);
++static void pres_lock(CFTimeInterval shown)
++{
++    long long P = xbox_vblank_period_us(), g, err, step;
++    if (s_pres_phase < 0) {
++        const char *e = getenv("NFSU2_PRESENT_LOCK"), *ph = getenv("NFSU2_PRESENT_PHASE");
++        s_pres_phase = e && *e == '0' ? 1000000000LL : ph ? atoll(ph) : 9000;
++    }
++    if (s_pres_phase >= 1000000000LL || P < 8000 || P > 17000)
++        return;
++    /* the grid point in the vblank's clock (CLOCK_MONOTONIC us) */
++    g = (long long)(hz_now() / 1000) - (long long)((CACurrentMediaTime() - shown) * 1e6);
++    if (P < 16000) P *= 2;            /* 120 Hz vblank: lock every other tick to the 60 Hz grid */
++    err = (xbox_vblank_next_us() - g - s_pres_phase) % P;
++    if (err < 0) err += P;
++    if (err > P / 2) err -= P;        /* > 0: the vblank is late against the grid */
++    step = -err / 8;
++    if (step > 250) step = 250;
++    if (step < -250) step = -250;
++    if (step)
++        xbox_vblank_nudge(step);
++    s_pres_err_sum += err < 0 ? -err : err;
++    if ((err < 0 ? -err : err) > s_pres_err_max) s_pres_err_max = err < 0 ? -err : err;
++    s_pres_err_n++;
++}
++static double s_pres_last;
++static uint32_t s_pres_never;
++static int pres_mode(void)
++{
++    if (s_pres_mode < 0) {
++        const char *e = getenv("NFSU2_PRESENT");
++        s_pres_mode = !e || !*e ? 2 : !strcmp(e, "free") ? 0 : !strcmp(e, "sync") ? 1 : 2;
++    }
++    return s_pres_mode;
++}
+ static double s_ft_last_end;
+ static int s_ft_dumped;            /* this flip wrote a dump: its present and the next flip are skipped */
+ static void ft_add(FtStat *f, double ms)
+@@ -256,9 +310,27 @@ static int square_on(void)
+     return on && s_square_cur;
+ }
+ 
++/* NFSU2_OFFSCREEN_SCALE=<k>: surfaces smaller than the frame (car
++ * reflection faces, glow and shadow targets: under 512x384) render at
++ * min(scale, k) -- they are filtered or blurred before they reach the
++ * screen, and at 2.0x they cost GPU time the frame does not show.
++ * Default 1.0 (60 fps budget, 2026-11-07: -1.5 ms GPU p50 at 2.0x);
++ * 0 = every surface at the render scale. */
++static double offscreen_scale(uint32_t w, uint32_t h)
++{
++    static double k = -1;
++    if (k < 0) {
++        const char *e = getenv("NFSU2_OFFSCREEN_SCALE");
++        k = e && *e ? strtod(e, NULL) : 1.0;
++        if (k > 0 && k < 0.5) k = 0.5;
++    }
++    return (k > 0 && (w < 512 || h < 384) && k < s_scale) ? k : s_scale;
++}
++
+ static void stored_size(uint32_t w, uint32_t h, uint32_t *pw, uint32_t *ph)
+ {
+-    double kx = s_scale * (square_on() ? (w < 1280 ? 4.0 / 3.0 : 2.0 / 3.0) : 1.0), ky = s_scale;
++    double sc = offscreen_scale(w, h);
++    double kx = sc * (square_on() ? (w < 1280 ? 4.0 / 3.0 : 2.0 / 3.0) : 1.0), ky = sc;
+     if (w * kx > (double)s_max_size)
+         kx = (double)s_max_size / w;
+     if (h * ky > (double)s_max_size)
+@@ -523,6 +595,12 @@ static void surf_reset(MtSurf *s)
+     s->va = va; s->w = w; s->h = h; s->used = s_frame;
+     s->aa_sx = aa_sx; s->aa_sy = aa_sy;
+     stored_size(w, h, &s->pw, &s->ph);
++    {   /* RECOMP_SURF_LOG=1: each new surface size once (dev census) */
++        static int on = -1, n;
++        if (on < 0) { const char *e = getenv("RECOMP_SURF_LOG"); on = e && *e == '1'; }
++        if (on && n++ < 200)
++            fprintf(stderr, "[surf] frame %u: 0x%08X %ux%u -> %ux%u\n", s_frame, va, w, h, s->pw, s->ph);
++    }
+     s->tex = make_texture(MTLTextureType2D, MTLPixelFormatBGRA8Unorm, s->pw, s->ph,
+                           MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead);
+     if (!s->tex) {
+@@ -2017,7 +2095,7 @@ static int ready(void)
+ #if TARGET_OS_OSX
+         /* The game paces itself (vblank emulation): presenting must not
+          * block it (nv2a_vk asks for immediate/mailbox for the same reason). */
+-        s_layer.displaySyncEnabled = NO;
++        s_layer.displaySyncEnabled = pres_mode() ? YES : NO;
+ #endif
+     }
+     s_queue = [s_dev newCommandQueue];
+@@ -3150,10 +3228,14 @@ static void present(MtSurf *s)
+         double ww = ds.width, wh = ds.height, scale, dw, dh;
+         if (xbox_video_widescreen() && lw < lh * 1.5)
+             lw = lh * 16.0 / 9.0;
+-        if (xbox_apple_screen_crop() && ww / wh < lw / lh - 0.01) {
+-            /* A screen narrower than the picture (16:10 Macs): fill its
++        if (xbox_apple_screen_crop() && ww / wh < lw / lh - 0.01 &&
++            s->w == 640 && s->aa_sx <= 1) {
++            /* A screen narrower than the picture (16:10 Macs), the race
++             * buffer (640 wide, no AA: hud_wide.c's test): fill its
+              * height and cut the sides, which hold no HUD (hud_wide.c
+-             * moves the HUD to the visible edges). */
++             * moves the HUD to the visible edges). The front end (1280x480,
++             * aa 2x1) is fitted whole (owner 2026-11-07: the menus were
++             * cut at the sides). */
+             double vis = (ww / wh) / (lw / lh);
+             nfsu2_hud_visible = (float)vis;
+             draw_copy_uv(s->tex, s->pw, s->ph, drawable.texture, 0.5 - 0.5 * vis, 0.5 + 0.5 * vis,
+@@ -3172,7 +3254,34 @@ static void present(MtSurf *s)
+     s_copy_gamma = 0;
+     s_copy_fxaa = 0;
+     skip_indicator(drawable.texture);
+-    [s_cb presentDrawable:drawable];
++    {
++        static int timing = -1;
++        if (timing < 0) {
++            const char *e = getenv("RECOMP_FPS_LOG");
++            timing = e && *e == '1';
++        }
++        if (timing || pres_mode())
++            [drawable addPresentedHandler:^(id<MTLDrawable> d) {
++                CFTimeInterval t = d.presentedTime;
++                if (t > 0.0 && pres_mode())
++                    pres_lock(t);
++                if (!timing)
++                    return;
++                pthread_mutex_lock(&s_ft_lock);
++                if (t <= 0.0)
++                    s_pres_never++;
++                else {
++                    if (s_pres_last > 0.0 && t > s_pres_last)
++                        ft_add(&s_ft_pres, (t - s_pres_last) * 1000.0);
++                    s_pres_last = t;
++                }
++                pthread_mutex_unlock(&s_ft_lock);
++            }];
++    }
++    if (pres_mode() == 2)
++        [s_cb presentDrawable:drawable afterMinimumDuration:1.0 / 60.0];
++    else
++        [s_cb presentDrawable:drawable];
+ }
+ 
+ static void mtl_flip_inner(void)
+@@ -3254,6 +3363,21 @@ static void mtl_flip_inner(void)
+                         s_ft_flip.n, ft_pct(&s_ft_flip, 0.5), ft_pct(&s_ft_flip, 0.99), s_ft_flip.max,
+                         s_ft_flip.missed, ft_pct(&s_ft_gpu, 0.5), ft_pct(&s_ft_gpu, 0.99), s_ft_gpu.max,
+                         s_ft_gpu.over, ft_pct(&s_ft_ready, 0.99), s_ft_ready.max, s_ft_ready.missed);
++                if (s_ft_pres.n || s_pres_never) {
++                    uint32_t fast = 0;
++                    for (int b = 0; b < 140; b++) fast += s_ft_pres.hist[b];
++                    fprintf(stderr, "[present] %u shown (%.1f/s), p50 %.1f p99 %.1f max %.1f ms,"
++                            " held > 25 ms %u, under 14 ms %u, never shown %u; vblank phase error"
++                            " mean %.2f max %.2f ms\n",
++                            s_ft_pres.n, s_ft_pres.n / dt, ft_pct(&s_ft_pres, 0.5),
++                            ft_pct(&s_ft_pres, 0.99), s_ft_pres.max, s_ft_pres.missed, fast,
++                            s_pres_never, s_pres_err_n ? s_pres_err_sum / s_pres_err_n / 1000.0 : 0.0,
++                            s_pres_err_max / 1000.0);
++                }
++                s_pres_err_sum = s_pres_err_max = 0.0;
++                s_pres_err_n = 0;
++                memset(&s_ft_pres, 0, sizeof s_ft_pres);
++                s_pres_never = 0;
+                 memset(&s_ft_gpu, 0, sizeof s_ft_gpu);
+                 memset(&s_ft_ready, 0, sizeof s_ft_ready);
+                 memset(&s_ft_flip, 0, sizeof s_ft_flip);

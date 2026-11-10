@@ -1,0 +1,143 @@
+From 7bd8e8af5cff4e099ccc8dc8bd5bc6556bdec82f Mon Sep 17 00:00:00 2001
+From: LeoDeadware <351117497+LeoDeadware@users.noreply.github.com>
+Date: Sat, 7 Nov 2026 20:04:23 +0200
+Subject: [PATCH 15/24] macOS: pad events without focus + window activation;
+ movies in full range (v1.0.1)
+
+Owner 2026-11-07: gamepad dead in the borderless full-panel window (not key,
+app inactive -> SDL dropped pad events): JOYSTICK_ALLOW_BACKGROUND_EVENTS,
+activate + makeKey, focus/controller log lines. Grey movie edges: the YUV
+tables give studio range (black 16), expanded to 0..255 in sub_0025ECB4
+(NFSU2_MOVIE_RANGE=0 off). NFSU2_MOVIE_DUMP=N dumps a movie picture.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/apple/apple_main.c   | 12 ++++++++++++
+ src/apple/apple_window.m | 10 ++++++++++
+ src/movie_crop.c         | 12 ++++++++++++
+ src/recomp_manual.c      | 24 ++++++++++++++++++++++++
+ 4 files changed, 58 insertions(+)
+
+diff --git a/src/apple/apple_main.c b/src/apple/apple_main.c
+index 4eeec48..f1fd30e 100644
+--- a/src/apple/apple_main.c
++++ b/src/apple/apple_main.c
+@@ -54,6 +54,7 @@ static void set_full(SDL_Window *w, int on)
+     if (on) {
+         SDL_SetWindowBordered(w, SDL_FALSE);
+         full_panel(w);
++        SDL_RaiseWindow(w);
+     } else {
+         apple_window_restore();
+         SDL_SetWindowBordered(w, SDL_TRUE);
+@@ -306,6 +307,9 @@ int main(int argc, char **argv)
+ #endif
+     /* Controllers too: macOS delivers their arrival and input through the
+      * main run loop, which only this thread pumps. */
++    /* v1.0.1 owner test «чому не працює геймпад?»: pad input must not depend on the window's
++     * focus (a borderless full-panel window that is not key got no pad input). */
++    SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, "1");
+     if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMECONTROLLER) != 0) {
+         fprintf(stderr, "[apple] SDL video: %s\n", SDL_GetError());
+         return 1;
+@@ -421,6 +425,14 @@ int main(int argc, char **argv)
+         if (smoke_deadline) {
+             if (!SDL_WaitEventTimeout(&e, 50)) continue;
+         } else if (!SDL_WaitEvent(&e)) continue;
++#endif
++#if !TARGET_OS_IPHONE
++        if (e.type == SDL_WINDOWEVENT && (e.window.event == SDL_WINDOWEVENT_FOCUS_GAINED ||
++                                          e.window.event == SDL_WINDOWEVENT_FOCUS_LOST))
++            fprintf(stderr, "[apple] window focus %s\n",
++                    e.window.event == SDL_WINDOWEVENT_FOCUS_GAINED ? "gained" : "lost");
++        if (e.type == SDL_CONTROLLERDEVICEADDED || e.type == SDL_CONTROLLERDEVICEREMOVED)
++            fprintf(stderr, "[apple] controller %s\n", e.type == SDL_CONTROLLERDEVICEADDED ? "added" : "removed");
+ #endif
+         if (e.type == SDL_QUIT) {
+             fprintf(stderr, "[apple] window closed\n");
+diff --git a/src/apple/apple_window.m b/src/apple/apple_window.m
+index 01f5781..b9a8241 100644
+--- a/src/apple/apple_window.m
++++ b/src/apple/apple_window.m
+@@ -25,6 +25,16 @@ void apple_window_full_panel(void *nswindow)
+     [NSApp setPresentationOptions:NSApplicationPresentationHideDock | NSApplicationPresentationHideMenuBar];
+     w.level = NSMainMenuWindowLevel + 1;
+     [w setFrame:sc.frame display:YES];
++    /* Key and active: macOS gives pad (GameController) and key input to the active app only. */
++    [NSApp activateIgnoringOtherApps:YES];
++    [w makeKeyAndOrderFront:nil];
++    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 3 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
++        if (!w.isKeyWindow || !NSApp.isActive) {
++            [NSApp activateIgnoringOtherApps:YES];
++            [w makeKeyAndOrderFront:nil];
++        }
++        fprintf(stderr, "[apple] window key %d, app active %d (3 s)\n", (int)w.isKeyWindow, (int)NSApp.isActive);
++    });
+     fprintf(stderr, "[apple] window over the whole panel %.0fx%.0f pt (notch %.0f pt)\n",
+             sc.frame.size.width, sc.frame.size.height,
+             [sc respondsToSelector:@selector(safeAreaInsets)] ? sc.safeAreaInsets.top : 0.0);
+diff --git a/src/movie_crop.c b/src/movie_crop.c
+index 96786d9..b9ffaa1 100644
+--- a/src/movie_crop.c
++++ b/src/movie_crop.c
+@@ -23,6 +23,9 @@
+ 
+ #include "../xboxrecomp/src/kernel/nv2a_backend.h"
+ 
++#include <stddef.h>
++extern ptrdiff_t g_xbox_mem_offset;
++#define GUEST(a) ((uint8_t *)((uintptr_t)(uint32_t)(a) + g_xbox_mem_offset))
+ extern uint32_t nfsu2_movie_row;
+ extern char nfsu2_movie_name[64];
+ 
+@@ -92,6 +95,15 @@ static void movie_hook(Nv2aRawBatch *rb, float *attrs)
+     if (!t || nfsu2_movie_row < t || nfsu2_movie_row >= t + MOVIE_BYTES)
+         return;
+     nfsu2_movie_draws++;
++    {   /* NFSU2_MOVIE_DUMP=N: the picture of the Nth movie draw -> movie.raw (640x480 BGRA) */
++        static long dump = -2;
++        if (dump == -2) { const char *e = getenv("NFSU2_MOVIE_DUMP"); dump = e ? atol(e) : -1; }
++        if (dump >= 0 && (long)nfsu2_movie_draws == dump) {
++            FILE *f = fopen("movie.raw", "wb");
++            if (f) { fwrite((const void *)GUEST(t), 1, MOVIE_BYTES, f); fclose(f); }
++            fprintf(stderr, "[movie] dumped draw %ld of %s\n", dump, nfsu2_movie_name);
++        }
++    }
+     if (crop_on() && rb->prim == 7 && rb->vertex_count == 4 && (rb->attr_present & 1u)
+         && player_quad(rb, attrs)) {
+         for (i = 0; i < 4; i++) {
+diff --git a/src/recomp_manual.c b/src/recomp_manual.c
+index 9728ee6..1dff6dd 100644
+--- a/src/recomp_manual.c
++++ b/src/recomp_manual.c
+@@ -1753,6 +1753,30 @@ void sub_0025ECB4(void)
+     ecx = y + 2u * n;
+     edx = u + n;
+     esp += 4;                           /* cdecl: the caller pops the arguments */
++
++    /* The title's tables give studio range (black 16, white 235), so a movie's
++     * own black (THX, the trailer's letterbox) showed grey against the
++     * presenter's pure black bars (owner 2026-11-07, "white frames"). Expand
++     * to full range, colour bytes only; NFSU2_MOVIE_RANGE=0 keeps the
++     * original. After the register replay above, which reads the row. */
++    {
++        static int on = -1;
++        static uint8_t lut[256];
++        if (on < 0) {
++            const char *e = getenv("NFSU2_MOVIE_RANGE");
++            on = !(e && *e == '0');
++            for (k = 0; k < 256; k++) {
++                int x = ((int)k - 16) * 255 / 219;
++                lut[k] = (uint8_t)(x < 0 ? 0 : x > 255 ? 255 : x);
++            }
++        }
++        if (on) {
++            uint8_t *o = (uint8_t *)XBOX_PTR(dst);
++            for (k = 0; k < n * 8u; k += 4) {
++                o[k] = lut[o[k]]; o[k + 1] = lut[o[k + 1]]; o[k + 2] = lut[o[k + 2]];
++            }
++        }
++    }
+ }
+ 
+ /* ── Movie file names, sub_00129610 ──────────────────────────

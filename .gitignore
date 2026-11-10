@@ -1,0 +1,11 @@
+# the community base (tools/fetch_community.sh), game data, generated code, builds
+/community/
+/game/
+/work/
+/out/
+/.cache/
+*.xbe
+*.iso
+*.xiso
+__pycache__/
+.DS_Store

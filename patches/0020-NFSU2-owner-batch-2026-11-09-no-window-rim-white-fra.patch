@@ -1,0 +1,353 @@
+From 7d0b29e2d6a8e597b8d2d676431534c4c8b4b7de Mon Sep 17 00:00:00 2001
+From: LeoDeadware <351117497+LeoDeadware@users.noreply.github.com>
+Date: Mon, 9 Nov 2026 22:41:24 +0200
+Subject: [PATCH 20/24] NFSU2 owner batch 2026-11-09: no window rim (white
+ frame), invariant positions (multi-pass z-fight), Cmd+Option+F fps counter,
+ all six reflection cube faces every frame
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/apple/apple_main.c                     |   7 ++
+ src/apple/apple_window.m                   |   6 ++
+ src/recomp_manual.c                        |  89 +++++++++++++++
+ xboxrecomp/src/nv2a_metal/nv2a_metal.m     | 119 +++++++++++++++++++++
+ xboxrecomp/src/nv2a_metal/nv2a_metal_msl.c |   8 ++
+ 5 files changed, 229 insertions(+)
+
+diff --git a/src/apple/apple_main.c b/src/apple/apple_main.c
+index 6411fce..a92de6c 100644
+--- a/src/apple/apple_main.c
++++ b/src/apple/apple_main.c
+@@ -452,6 +452,13 @@ int main(int argc, char **argv)
+ #else
+         if (e.type == SDL_KEYDOWN && e.key.keysym.scancode == SDL_SCANCODE_F11 && !e.key.repeat && s_win)
+             set_full(s_win, !s_full);
++        if (e.type == SDL_KEYDOWN && e.key.keysym.scancode == SDL_SCANCODE_F && !e.key.repeat &&
++            (e.key.keysym.mod & KMOD_GUI) && (e.key.keysym.mod & KMOD_ALT)) {
++            extern volatile int nv2a_mtl_fps_overlay;   /* owner 2026-11-09: Cmd+Option+F */
++            nv2a_mtl_fps_overlay = !nv2a_mtl_fps_overlay;
++            fprintf(stderr, "[fps] counter %s\n", nv2a_mtl_fps_overlay ? "on" : "off");
++            continue;
++        }
+         apple_keyboard_event(&e);
+         if (e.type == SDL_JOYDEVICEADDED || e.type == SDL_JOYDEVICEREMOVED)
+             apple_keyboard_controllers_changed();
+diff --git a/src/apple/apple_window.m b/src/apple/apple_window.m
+index 629670d..1d20fb8 100644
+--- a/src/apple/apple_window.m
++++ b/src/apple/apple_window.m
+@@ -52,6 +52,12 @@ void apple_window_full_panel(void *nswindow)
+         return;
+     [NSApp setPresentationOptions:NSApplicationPresentationHideDock | NSApplicationPresentationHideMenuBar];
+     w.level = NSMainMenuWindowLevel + 1;
++    /* No rim (owner 2026-11-09 "біла рамка"): macOS draws a 1 px light outline with the
++     * shadow of every non-fullscreen window, borderless ones too; over the game it is a
++     * white frame round the screen. */
++    w.hasShadow = NO;
++    w.opaque = YES;
++    w.backgroundColor = NSColor.blackColor;
+     [w setFrame:sc.frame display:YES];
+     /* Key and active: macOS gives pad (GameController) and key input to the active app only. */
+     apple_activate(w);
+diff --git a/src/recomp_manual.c b/src/recomp_manual.c
+index 1dff6dd..b544f19 100644
+--- a/src/recomp_manual.c
++++ b/src/recomp_manual.c
+@@ -1125,6 +1125,74 @@ static float draw_distance(void)
+     return f;
+ }
+ 
++/* LOD/cull hysteresis (owner 2026-11-09 "текстури стрибають туди-сюди"): the drawer
++ * culls and picks the model by hard cut-offs on the size (1/16/17/23/32), so an object
++ * whose size wobbles around one (camera sway, a car's bob, the chase camera settling)
++ * pops in and out or swaps model every frame. Remembered per (view, instance position)
++ * for the last frames: once above a cut-off it stays above until the size falls 25 %
++ * under it. NFSU2_LOD_HYST=0 off. NFSU2_POP_LOG=1: crossings per second, raw vs kept. */
++#define LOD_SLOTS 32768u
++static struct { uint32_t key, frame; int32_t raw, out; } s_lod[LOD_SLOTS];
++static const int32_t s_cuts[] = { 2, 16, 17, 23, 32 };
++static unsigned long s_pop_raw, s_pop_out;
++
++static int lod_crossed(int32_t a, int32_t b)
++{
++    unsigned i;
++    for (i = 0; i < sizeof s_cuts / sizeof s_cuts[0]; i++)
++        if ((a >= s_cuts[i]) != (b >= s_cuts[i]))
++            return 1;
++    return 0;
++}
++
++static int32_t lod_hyst(uint32_t obj, uint32_t p, int32_t res)
++{
++    static int on = -1, log_on;
++    static uint32_t log_frame;
++    uint32_t frame = MEM32(0x3EA5E8), key = (p * 2654435761u) ^ (obj * 40503u), h, n;
++    int32_t out = res;
++    unsigned i;
++
++    if (on < 0) {
++        const char *e = getenv("NFSU2_LOD_HYST");
++        on = !(e && *e == '0');
++        e = getenv("NFSU2_POP_LOG");
++        log_on = e && *e == '1';
++        fprintf(stderr, "[lod] cut-off hysteresis %s\n", on ? "on (25 %)" : "off");
++    }
++    for (h = key & (LOD_SLOTS - 1), n = 0; n < 8; n++, h = (h + 1) & (LOD_SLOTS - 1))
++        if (s_lod[h].key == key || frame - s_lod[h].frame > 4u)
++            break;
++    if (n < 8 && s_lod[h].key == key && frame - s_lod[h].frame <= 2u) {
++        if (s_lod[h].frame != frame) {
++            if (on)
++                for (i = 0; i < sizeof s_cuts / sizeof s_cuts[0]; i++) {
++                    int32_t c = s_cuts[i];
++                    if (s_lod[h].out >= c && out < c && out * 4 >= c * 3)
++                        out = c;
++                }
++            s_pop_raw += lod_crossed(s_lod[h].raw, res);
++            s_pop_out += lod_crossed(s_lod[h].out, out);
++        } else {
++            out = s_lod[h].out > out && out * 4 >= s_lod[h].out * 3 ? s_lod[h].out : out;
++        }
++    }
++    if (n < 8) {
++        s_lod[h].key = key;
++        s_lod[h].frame = frame;
++        s_lod[h].raw = res;
++        s_lod[h].out = out;
++    }
++    if (log_on && frame - log_frame >= 60u) {
++        if (log_frame)
++            fprintf(stderr, "[pop] frame %u: %lu raw crossings, %lu kept (60 frames)\n",
++                    frame, s_pop_raw, s_pop_out);
++        log_frame = frame;
++        s_pop_raw = s_pop_out = 0;
++    }
++    return on ? out : res;
++}
++
+ void sub_001C6900(void)
+ {
+     static int mode = -1;
+@@ -1150,6 +1218,8 @@ void sub_001C6900(void)
+             double s = (double)v * draw_distance();
+             res = (uint32_t)(int32_t)(s > 2e9 ? 2e9 : s);
+         }
++        if (mode == 1)
++            res = (uint32_t)lod_hyst(obj, p, (int32_t)res);
+         x0.f[0] = v;
+         x0.f[1] = l;
+         x0.u[2] = caller_ebp;
+@@ -2343,6 +2413,25 @@ void sub_000B5140(void)
+ /* Env-map update scheduler (thiscall, 2 args, ret 8). */
+ void sub_0009B720(void)
+ {
++    /* All six cube faces every frame (owner 2026-11-09 "відображення дригаються"): the
++     * schedule (rows of six dwords at 0x39CE20, row = frame % [0x39CE18], nonzero = this
++     * face now) redraws a few faces per frame, so the paint samples faces from different
++     * frames and car positions and the reflection jerks while driving. The scheduler also
++     * sets up the view of each face it marks, so the rows are filled, not the bytes after
++     * it. Faces are 128x128, ~40 draws each. NFSU2_REFL_ALL=0: the title's schedule. */
++    static int all = -1;
++    if (all < 0) {
++        const char *e = getenv("NFSU2_REFL_ALL");
++        all = !(e && *e == '0');
++        fprintf(stderr, "[refl] cube faces: %s\n", all ? "all six every frame" : "title schedule");
++    }
++    if (all && s_refl) {
++        uint32_t rows = MEM32(0x39CE18), r, j;
++        for (r = 0; r < rows && r < 64; r++)
++            for (j = 0; j < 6; j++)
++                if (!MEM32(0x39CE20 + r * 24 + j * 4))
++                    MEM32(0x39CE20 + r * 24 + j * 4) = 1;
++    }
+     sub_0009B720_gen();
+     refl_views();
+ }
+diff --git a/xboxrecomp/src/nv2a_metal/nv2a_metal.m b/xboxrecomp/src/nv2a_metal/nv2a_metal.m
+index ae23c89..c2b3ec8 100644
+--- a/xboxrecomp/src/nv2a_metal/nv2a_metal.m
++++ b/xboxrecomp/src/nv2a_metal/nv2a_metal.m
+@@ -2347,6 +2347,16 @@ static int ready(void)
+         s_copts.fastMathEnabled = NO;
+ #pragma clang diagnostic pop
+     }
++    {   /* Invariant positions (nv2a_metal_msl.c VOut): without them the compiler may fuse a
++         * program's multiply-adds differently from another's, and layers drawn over the same
++         * geometry got different depths and flickered. RECOMP_MTL_INVARIANT=0 off. */
++        const char *e = getenv("RECOMP_MTL_INVARIANT");
++        if (!(e && *e == '0')) {
++            s_copts.preserveInvariance = YES;
++            s_copts.preprocessorMacros = @{ @"NV2A_INV": @1 };
++        }
++        LOGE("invariant positions %s\n", (e && *e == '0') ? "off" : "on");
++    }
+     s_max_size = [s_dev supportsFamily:MTLGPUFamilyApple3] ? 16384 : 8192;
+     /* Apple4+ (every Apple-silicon Mac and A11+ device; the builds are
+      * arm64 only). */
+@@ -2489,8 +2499,11 @@ static MTLStencilOperation stencil_op(uint32_t v)
+     uint32_t cull, cullmode, front;
+     DsKey    ds;
+     uint32_t sref, bcolor;
++    uint32_t zb_on, zb_scale, zb_bias;          /* polygon offset (fill), float bits */
+ } DynState;
+ static DynState s_dyn;
++static uint32_t zmax_of(const uint32_t *r);
++static int s_zb_seen;
+ 
+ /* Returns 0 when the draw shows nothing (front-and-back culled triangles:
+  * Metal has no such cull mode). */
+@@ -2511,6 +2524,35 @@ static int apply_dynamic(const uint32_t *r, int has_depth, uint32_t cls)
+         d.sref = r[0x368 / 4] & 0xFF;
+     }
+     d.bcolor = r[0x34C / 4];
++    /* Polygon offset (owner 2026-11-09 "текстури стрибають"): decals, road paint and
++     * shadows lie on their surface with a depth bias; without it they z-fight. NV2A's
++     * bias is in Z-buffer units; Metal's float-depth unit near z = 1 is 2^-24, about one
++     * Z24 step, so Z24 passes it as is and Z16 x256. RECOMP_MTL_ZBIAS=0 off. */
++    {
++        static int zb = -1;
++        if (zb < 0) {
++            const char *e = getenv("RECOMP_MTL_ZBIAS");
++            zb = !(e && *e == '0');
++        }
++        if (zb && has_depth && cls == 2 && r[0x338 / 4]) {
++            d.zb_on = 1;
++            d.zb_scale = r[0x384 / 4];
++            d.zb_bias = r[0x388 / 4];
++            if (zmax_of(r) == 0xFFFFu) {
++                float b;
++                memcpy(&b, &d.zb_bias, 4);
++                b *= 256.0f;
++                memcpy(&d.zb_bias, &b, 4);
++            }
++            if (!s_zb_seen) {
++                float a, b;
++                memcpy(&a, &d.zb_scale, 4);
++                memcpy(&b, &d.zb_bias, 4);
++                fprintf(stderr, "[mtl] polygon offset in use (scale %.3f, bias %.1f)\n", a, b);
++                s_zb_seen = 1;
++            }
++        }
++    }
+     if (d.cull && d.cullmode == 0x408 && cls == 2)
+         return 0;
+     if (s_dyn_valid && !memcmp(&d, &s_dyn, sizeof d))
+@@ -2527,6 +2569,15 @@ static int apply_dynamic(const uint32_t *r, int has_depth, uint32_t cls)
+         [s_enc setDepthStencilState:ds_get(&d.ds)];
+     if (!s_dyn_valid || d.sref != s_dyn.sref)
+         [s_enc setStencilReferenceValue:d.sref];
++    if (!s_dyn_valid || d.zb_on != s_dyn.zb_on || d.zb_scale != s_dyn.zb_scale
++        || d.zb_bias != s_dyn.zb_bias) {
++        float a = 0, b = 0;
++        if (d.zb_on) {
++            memcpy(&a, &d.zb_scale, 4);
++            memcpy(&b, &d.zb_bias, 4);
++        }
++        [s_enc setDepthBias:b slopeScale:a clamp:0];
++    }
+     if (!s_dyn_valid || d.bcolor != s_dyn.bcolor) {
+         float bc[4];
+         argb_vec4(d.bcolor, bc);
+@@ -3450,6 +3501,73 @@ static void skip_indicator(id<MTLTexture> dst)
+     [e endEncoding];
+ }
+ 
++/* FPS counter (owner 2026-11-09: Cmd+Option+F, off by default; the host flips
++ * nv2a_mtl_fps_overlay). Top-left: frames in the last second, then the worst
++ * frame of that second in ms, as 3x5 digits drawn with scissored clears. */
++volatile int nv2a_mtl_fps_overlay;
++static void fps_overlay(id<MTLTexture> dst)
++{
++    static double last_t, win_t, worst, shown_worst;
++    static int frames, shown_fps;
++    static const uint16_t G[10] = { 0x7B6F, 0x2C97, 0x73E7, 0x73CF, 0x5BC9, 0x79CF, 0x79EF, 0x7249, 0x7BEF, 0x7BCF };
++    double now = CACurrentMediaTime(), H = dst.height, c = H / 120.0, x0 = H * 0.03, y0 = H * 0.03;
++    float z = 0.0f, bg[4] = { 0, 0, 0, 0.6f }, col[4] = { 0.2f, 1.0f, 0.3f, 1 }, col2[4] = { 1, 1, 1, 1 };
++    MTLRenderPassDescriptor *rp;
++    id<MTLRenderCommandEncoder> e;
++    char t[2][8];
++    static int env = -1;
++
++    if (env < 0) {
++        const char *ev = getenv("NFSU2_FPS_COUNTER");
++        env = ev && *ev == '1';
++        if (env) nv2a_mtl_fps_overlay = 1;
++    }
++    if (last_t > 0.0) {
++        double d = (now - last_t) * 1000.0;
++        if (d > worst) worst = d;
++        frames++;
++    }
++    last_t = now;
++    if (now - win_t >= 1.0) {
++        shown_fps = win_t > 0.0 ? (int)(frames / (now - win_t) + 0.5) : 0;
++        shown_worst = worst;
++        frames = 0; worst = 0; win_t = now;
++    }
++    if (!nv2a_mtl_fps_overlay)
++        return;
++    if (c < 2) c = 2;
++    snprintf(t[0], sizeof t[0], "%d", shown_fps > 999 ? 999 : shown_fps);
++    snprintf(t[1], sizeof t[1], "%d", shown_worst > 999 ? 999 : (int)(shown_worst + 0.5));
++    if (shown_fps < 58) { col[0] = 1.0f; col[1] = shown_fps < 45 ? 0.25f : 0.8f; col[2] = 0.2f; }
++    rp = [MTLRenderPassDescriptor renderPassDescriptor];
++    rp.colorAttachments[0].texture = dst;
++    rp.colorAttachments[0].loadAction = MTLLoadActionLoad;
++    rp.colorAttachments[0].storeAction = MTLStoreActionStore;
++    e = [s_cb renderCommandEncoderWithDescriptor:rp];
++    [e setRenderPipelineState:s_clear_pipe[1][0]];
++    [e setVertexBytes:&z length:sizeof z atIndex:0];
++    {
++        MTLScissorRect sc = { (NSUInteger)(x0 - c), (NSUInteger)(y0 - c), (NSUInteger)(c * 15), (NSUInteger)(c * 15) };
++        [e setScissorRect:sc];
++        [e setFragmentBytes:bg length:sizeof bg atIndex:0];
++        [e drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];
++    }
++    for (int row = 0; row < 2; row++) {
++        [e setFragmentBytes:(row ? col2 : col) length:sizeof col atIndex:0];
++        for (int i = 0; t[row][i]; i++) {
++            uint16_t g = G[t[row][i] - '0'];
++            for (int b = 0; b < 15; b++) {
++                if (!(g >> (14 - b) & 1)) continue;
++                MTLScissorRect sc = { (NSUInteger)(x0 + (i * 4 + b % 3) * c),
++                                      (NSUInteger)(y0 + (row * 7 + b / 3) * c), (NSUInteger)c, (NSUInteger)c };
++                [e setScissorRect:sc];
++                [e drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];
++            }
++        }
++    }
++    [e endEncoding];
++}
++
+ static void present(MtSurf *s)
+ {
+     id<CAMetalDrawable> drawable;
+@@ -3505,6 +3623,7 @@ static void present(MtSurf *s)
+     s_copy_gamma = 0;
+     s_copy_fxaa = 0;
+     skip_indicator(drawable.texture);
++    fps_overlay(drawable.texture);
+     {
+         static int timing = -1;
+         if (timing < 0) {
+diff --git a/xboxrecomp/src/nv2a_metal/nv2a_metal_msl.c b/xboxrecomp/src/nv2a_metal/nv2a_metal_msl.c
+index 1e7347a..94f533f 100644
+--- a/xboxrecomp/src/nv2a_metal/nv2a_metal_msl.c
++++ b/xboxrecomp/src/nv2a_metal/nv2a_metal_msl.c
+@@ -83,8 +83,16 @@ static const char s_vs_head[] =
+     "    float4 v12 [[attribute(12)]]; float4 v13 [[attribute(13)]];\n"
+     "    float4 v14 [[attribute(14)]]; float4 v15 [[attribute(15)]];\n"
+     "};\n"
++    /* NV2A_INV = 1 (nv2a_metal.m, RECOMP_MTL_INVARIANT): one position for the same
++     * vertex in every program, so multi-pass layers (road decals, lightmaps, the car's paint and
++     * reflection passes) depth-test equal instead of z-fighting (owner 2026-11-09 "текстури
++     * стрибають"). */
+     "struct VOut {\n"
++    "#if defined(NV2A_INV) && NV2A_INV\n"
++    "    float4 pos [[position, invariant]];\n"
++    "#else\n"
+     "    float4 pos [[position]];\n"
++    "#endif\n"
+     "    float4 vD0; float4 vD1;\n"
+     "    float4 vT0; float4 vT1; float4 vT2; float4 vT3;\n"
+     "    float vFog;\n"

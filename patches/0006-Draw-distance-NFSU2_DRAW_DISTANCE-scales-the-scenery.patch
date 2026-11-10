@@ -1,0 +1,56 @@
+From 9cc7fc9b66839bf0c598d423c3b7aff6f13ba69e Mon Sep 17 00:00:00 2001
+From: LeoDeadware <351117497+LeoDeadware@users.noreply.github.com>
+Date: Fri, 6 Nov 2026 23:27:50 +0200
+Subject: [PATCH 06/24] Draw distance: NFSU2_DRAW_DISTANCE scales the scenery
+ drawer's screen size (default x2)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/recomp_manual.c | 27 +++++++++++++++++++++++++++
+ 1 file changed, 27 insertions(+)
+
+diff --git a/src/recomp_manual.c b/src/recomp_manual.c
+index c607e4a..ca05225 100644
+--- a/src/recomp_manual.c
++++ b/src/recomp_manual.c
+@@ -961,6 +961,29 @@ static int32_t sphere_fade(uint32_t obj, uint32_t p, float r, int *pcmp, uint16_
+     return 0;
+ }
+ 
++/* Draw distance (Deadware item 4). sub_001C6900's only caller, the scenery
++ * instance drawer sub_001C69C0 (0x1C6A9A), reads its result as the object's
++ * size on a 640x480 screen: <= 1 not drawn, then under 16/17/23/32 (by the
++ * object's flags and sub_00098E40's detail level) not drawn, and larger
++ * sizes pick the finer model (+0x30/+0x34/+0x38 of the instance's model
++ * set; sub_001C69C0 0x1C6AC2-0x1C6B78). We render at 2-4x that resolution,
++ * so those cut-offs fall at a few real pixels. NFSU2_DRAW_DISTANCE=<f>
++ * (0.5..8, default 2) multiplies the size the drawer sees: objects stay
++ * drawn and keep their finer model f times as far. 1 = the original. Not
++ * applied in the RECOMP_NATIVE_CHECK=1 comparison mode. */
++static float draw_distance(void)
++{
++    static float f = -1.0f;
++    if (f < 0.0f) {
++        const char *e = getenv("NFSU2_DRAW_DISTANCE");
++        f = e ? (float)atof(e) : 2.0f;
++        if (!(f >= 0.5f && f <= 8.0f))
++            f = 2.0f;
++        fprintf(stderr, "[draw] scenery draw distance x%.2f%s\n", f, f == 1.0f ? " (original)" : "");
++    }
++    return f;
++}
++
+ void sub_001C6900(void)
+ {
+     static int mode = -1;
+@@ -982,6 +1005,10 @@ void sub_001C6900(void)
+     x0 = g_xmm0;
+     if (sphere_fade(obj, p, r, &cmp, &cc, &v, &l) == 0) {
+         res = (uint32_t)(int32_t)v;
++        if (mode == 1 && draw_distance() != 1.0f) {
++            double s = (double)v * draw_distance();
++            res = (uint32_t)(int32_t)(s > 2e9 ? 2e9 : s);
++        }
+         x0.f[0] = v;
+         x0.f[1] = l;
+         x0.u[2] = caller_ebp;

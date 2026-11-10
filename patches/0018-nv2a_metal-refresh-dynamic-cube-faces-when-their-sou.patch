@@ -1,0 +1,145 @@
+From d2c6ecb83951e38ba2a45f9c9f69dec406fbff8c Mon Sep 17 00:00:00 2001
+From: LeoDeadware <351117497+LeoDeadware@users.noreply.github.com>
+Date: Sat, 7 Nov 2026 23:26:40 +0200
+Subject: [PATCH 18/24] nv2a_metal: refresh dynamic cube faces when their
+ source pass ends (no mid-pass back buffer split); opt-in frame-end depth
+ DontCare
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ xboxrecomp/src/nv2a_metal/nv2a_metal.m | 61 +++++++++++++++++++++++---
+ 1 file changed, 56 insertions(+), 5 deletions(-)
+
+diff --git a/xboxrecomp/src/nv2a_metal/nv2a_metal.m b/xboxrecomp/src/nv2a_metal/nv2a_metal.m
+index 04ec3dd..905edd0 100644
+--- a/xboxrecomp/src/nv2a_metal/nv2a_metal.m
++++ b/xboxrecomp/src/nv2a_metal/nv2a_metal.m
+@@ -267,6 +267,7 @@ static void frame_begin(void)
+     uint32_t va, pw, ph;
+     __strong id<MTLTexture> tex;
+     uint32_t used;
++    uint32_t first_f, first_clear;   /* frame of its first pass, and whether that pass cleared it */
+ } MtDepth;
+ 
+ #define MTL_MAX_SURF 32
+@@ -378,8 +379,19 @@ static void bindings_reset(void)
+     for (int i = 0; i < 4; i++) { s_tex_cur[i] = nil; s_smp_cur[i] = nil; }
+ }
+ 
++/* Depth/stencil store decided when the pass ends (MTLStoreActionUnknown at begin): the frame's
++ * last pass on a depth buffer that its frame's first pass clears (depth and stencil) drops it
++ * instead of writing 33 MB at 4x back. Set by the flip. Opt-in RECOMP_MTL_DEPTH_DC=1 (A/B: fewer frames over budget, but higher GPU max spikes). */
++static int s_depth_dc_on = -1, s_end_depth_dc;
+ static void end_pass(void)
+ {
++    if (s_enc && s_rt_depth && s_depth_dc_on > 0) {
++        MTLStoreAction a = s_end_depth_dc && s_rt_depth->first_clear && s_rt_depth->first_f == s_frame
++                         ? MTLStoreActionDontCare : MTLStoreActionStore;
++        [s_enc setDepthStoreAction:a];
++        [s_enc setStencilStoreAction:a];
++    }
++    s_end_depth_dc = 0;
+     if (s_enc) {
+         [s_enc endEncoding];
+         s_enc = nil;
+@@ -477,6 +489,7 @@ static void set_surface_scissor(const uint32_t *r, const MtSurf *s)
+ /* RECOMP_DRAW_STATS: passes per frame and attachment traffic (MB loaded / stored) on the tile GPU. */
+ static uint32_t s_st_pass;
+ static double s_st_ld_mb, s_st_st_mb;
++static void cube_refresh_from(MtSurf *s);
+ static void begin_pass_clear(MtSurf *s, MtDepth *d, uint32_t flags,
+                              const float *color, double depth, uint32_t stencil)
+ {
+@@ -484,8 +497,13 @@ static void begin_pass_clear(MtSurf *s, MtDepth *d, uint32_t flags,
+ 
+     if (!flags && s_enc && s_rt == s && s_rt_depth == d)
+         return;
+-    end_pass();
+-    end_blit();
++    {
++        MtSurf *prev = s_enc ? s_rt : NULL;
++        end_pass();
++        end_blit();
++        if (prev && prev != s)
++            cube_refresh_from(prev);
++    }
+     rp = [MTLRenderPassDescriptor renderPassDescriptor];
+     rp.colorAttachments[0].texture = s->tex;
+     rp.colorAttachments[0].loadAction = (flags & 0xF0) ? MTLLoadActionClear : MTLLoadActionLoad;
+@@ -493,14 +511,19 @@ static void begin_pass_clear(MtSurf *s, MtDepth *d, uint32_t flags,
+         rp.colorAttachments[0].clearColor = MTLClearColorMake(color[0], color[1], color[2], color[3]);
+     rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+     if (d) {
++        if (s_depth_dc_on < 0) { const char *e = getenv("RECOMP_MTL_DEPTH_DC"); s_depth_dc_on = (e && *e == '1'); }
++        if (d->first_f != s_frame) {
++            d->first_f = s_frame;
++            d->first_clear = (flags & 3) == 3;
++        }
+         rp.depthAttachment.texture = d->tex;
+         rp.depthAttachment.loadAction = (flags & 1) ? MTLLoadActionClear : MTLLoadActionLoad;
+         rp.depthAttachment.clearDepth = depth;
+-        rp.depthAttachment.storeAction = MTLStoreActionStore;
++        rp.depthAttachment.storeAction = s_depth_dc_on ? MTLStoreActionUnknown : MTLStoreActionStore;
+         rp.stencilAttachment.texture = d->tex;
+         rp.stencilAttachment.loadAction = (flags & 2) ? MTLLoadActionClear : MTLLoadActionLoad;
+         rp.stencilAttachment.clearStencil = stencil;
+-        rp.stencilAttachment.storeAction = MTLStoreActionStore;
++        rp.stencilAttachment.storeAction = rp.depthAttachment.storeAction;
+     }
+     {
+         double cmb = s->pw * (double)s->ph * 4 / 1048576.0, dmb = d ? d->tex.width * (double)d->tex.height * 5 / 1048576.0 : 0;
+@@ -1319,7 +1342,7 @@ static void rescale_surfaces(double k)
+     uint32_t va, w, h, face, size;
+     __strong id<MTLTexture> tex;
+     MtSurf  *src[6];
+-    uint32_t gen[6];
++    uint32_t gen[6], src_va[6];
+     uint32_t used;
+ } MtCube;
+ #define MTL_MAX_CUBE 4
+@@ -1367,10 +1390,37 @@ static void rescale_surfaces(double k)
+                   0, 0, size, size);
+         c->src[f] = sf;
+         c->gen[f] = sf->gen;
++        c->src_va[f] = sf->va;
+     }
+     return c->tex;
+ }
+ 
++/* A pass into a cube face just ended: copy the face now, between passes. Done at the first
++ * sample instead, the copy ended the 4x back buffer's pass mid-scene (one more full reload and
++ * store of colour + depth, ~118 MB a frame). The sample-time check still catches anything else.
++ * RECOMP_MTL_CUBE_EARLY=0 off. */
++static void cube_refresh_from(MtSurf *s)
++{
++    static int on = -1;
++    int i;
++    uint32_t f;
++    if (on < 0) { const char *e = getenv("RECOMP_MTL_CUBE_EARLY"); on = !(e && *e == '0'); }
++    if (!on)
++        return;
++    for (i = 0; i < MTL_MAX_CUBE; i++) {
++        MtCube *c = &s_cube[i];
++        if (!c->tex)
++            continue;
++        for (f = 0; f < 6; f++) {
++            if (c->src[f] != s || c->gen[f] == s->gen || c->src_va[f] != s->va)
++                continue;
++            draw_copy(s->tex, to_stored(c->w, s->pw, s->w), to_stored(c->h, s->ph, s->h), c->tex, f, 0,
++                      0, 0, c->size, c->size);
++            c->gen[f] = s->gen;
++        }
++    }
++}
++
+ /* Samplers: wrap u, wrap v, mag, min. */
+ typedef struct { uint32_t key; __strong id<MTLSamplerState> s; } SamplerEnt;
+ static SamplerEnt s_samplers[64];
+@@ -3597,6 +3647,7 @@ static void mtl_flip_inner(void)
+         }
+     }
+     VT("flip %u: surface %08X drew %d\n", s_frame, s ? s->va : 0, s_drew_any);
++    s_end_depth_dc = 1;
+     if (!s_headless)
+         present(s);
+     post_frame(s);

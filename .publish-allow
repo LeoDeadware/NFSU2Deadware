@@ -1,0 +1,2 @@
+# Exceptions to tools/publish_check.py: glob + "# reason" (secrets are never allowed).
+NFSU2-players.dmg:*/hd/*  # owner's decision 2026-11-06 (HD in the DMG for all games): the players' DMG ships the ready HD pack, community HD textures credited; DMCA takedown within 24 h

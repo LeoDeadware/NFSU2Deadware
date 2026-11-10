@@ -1,0 +1,308 @@
+From d11dccc020acd672b26dbb5041e94897797bcb28 Mon Sep 17 00:00:00 2001
+From: LeoDeadware <351117497+LeoDeadware@users.noreply.github.com>
+Date: Sat, 7 Nov 2026 21:37:38 +0200
+Subject: [PATCH 16/24] Metal: full mip chains for game textures (LOD bias 0,
+ aniso on mipped) - road moire; window activation at start + pads monitored in
+ background; RECOMP_GL_DUMP_AT consecutive-frame dumps (v1.0.1)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/apple/apple_main.c                 |   4 +
+ src/apple/apple_window.m               |  37 +++++++--
+ xboxrecomp/src/nv2a_metal/nv2a_metal.m | 108 ++++++++++++++++++++++---
+ 3 files changed, 131 insertions(+), 18 deletions(-)
+
+diff --git a/src/apple/apple_main.c b/src/apple/apple_main.c
+index f1fd30e..6411fce 100644
+--- a/src/apple/apple_main.c
++++ b/src/apple/apple_main.c
+@@ -30,6 +30,7 @@
+ #if !TARGET_OS_IPHONE
+ #include <SDL_syswm.h>
+ void apple_window_full_panel(void *nswindow);   /* apple_window.m */
++void apple_pads_background(void);              /* apple_window.m */
+ void apple_window_restore(void);
+ int apple_window_notch_on(void);
+ static void full_panel(SDL_Window *w)
+@@ -310,6 +311,9 @@ int main(int argc, char **argv)
+     /* v1.0.1 owner test «чому не працює геймпад?»: pad input must not depend on the window's
+      * focus (a borderless full-panel window that is not key got no pad input). */
+     SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, "1");
++#if !TARGET_OS_IPHONE
++    apple_pads_background();                    /* GameController's own switch */
++#endif
+     if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMECONTROLLER) != 0) {
+         fprintf(stderr, "[apple] SDL video: %s\n", SDL_GetError());
+         return 1;
+diff --git a/src/apple/apple_window.m b/src/apple/apple_window.m
+index b9a8241..629670d 100644
+--- a/src/apple/apple_window.m
++++ b/src/apple/apple_window.m
+@@ -9,10 +9,38 @@
+  * frame. NFSU2_NOTCH=0: SDL's fullscreen as before.
+  */
+ #import <AppKit/AppKit.h>
++#import <objc/message.h>
+ 
+ #include <stdio.h>
+ #include <stdlib.h>
+ 
++/* After the launcher's execv the game image is not the app LaunchServices activated:
++ * macOS 14+ cooperative activation ignores activateIgnoringOtherApps there, so ask with
++ * -activate as well, and bring the window in front of the Finder's (owner 2026-11-07:
++ * "треба мишою клацнути по екрану"). */
++static void apple_activate(NSWindow *w)
++{
++    [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
++    if ([NSApp respondsToSelector:@selector(activate)])
++        [NSApp performSelector:@selector(activate)];
++    [NSApp activateIgnoringOtherApps:YES];
++    [[NSRunningApplication currentApplication] activateWithOptions:NSApplicationActivateAllWindows];
++    [w makeKeyAndOrderFront:nil];
++    [w orderFrontRegardless];
++}
++
++/* Pads keep sending while another app is in front (GameController's own switch; SDL's
++ * JOYSTICK_ALLOW_BACKGROUND_EVENTS hint covers SDL's side). No link to the framework:
++ * SDL has loaded it. Call before SDL_Init. */
++void apple_pads_background(void)
++{
++    Class gc = NSClassFromString(@"GCController");
++    if (gc && [gc respondsToSelector:@selector(setShouldMonitorBackgroundEvents:)]) {
++        ((void (*)(id, SEL, BOOL))objc_msgSend)(gc, @selector(setShouldMonitorBackgroundEvents:), YES);
++        fprintf(stderr, "[apple] pads monitored in the background\n");
++    }
++}
++
+ void apple_window_full_panel(void *nswindow)
+ {
+     NSWindow *w = (__bridge NSWindow *)nswindow;
+@@ -26,13 +54,10 @@ void apple_window_full_panel(void *nswindow)
+     w.level = NSMainMenuWindowLevel + 1;
+     [w setFrame:sc.frame display:YES];
+     /* Key and active: macOS gives pad (GameController) and key input to the active app only. */
+-    [NSApp activateIgnoringOtherApps:YES];
+-    [w makeKeyAndOrderFront:nil];
++    apple_activate(w);
+     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 3 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
+-        if (!w.isKeyWindow || !NSApp.isActive) {
+-            [NSApp activateIgnoringOtherApps:YES];
+-            [w makeKeyAndOrderFront:nil];
+-        }
++        if (!w.isKeyWindow || !NSApp.isActive)
++            apple_activate(w);
+         fprintf(stderr, "[apple] window key %d, app active %d (3 s)\n", (int)w.isKeyWindow, (int)NSApp.isActive);
+     });
+     fprintf(stderr, "[apple] window over the whole panel %.0fx%.0f pt (notch %.0f pt)\n",
+diff --git a/xboxrecomp/src/nv2a_metal/nv2a_metal.m b/xboxrecomp/src/nv2a_metal/nv2a_metal.m
+index 12f740c..0c24bd2 100644
+--- a/xboxrecomp/src/nv2a_metal/nv2a_metal.m
++++ b/xboxrecomp/src/nv2a_metal/nv2a_metal.m
+@@ -550,6 +550,20 @@ static void flush_frame_wait(void)
+     return NULL;
+ }
+ 
++static id<MTLTexture> make_texture_levels(MTLTextureType type, MTLPixelFormat fmt, uint32_t w,
++                                         uint32_t h, MTLTextureUsage usage, uint32_t levels)
++{
++    MTLTextureDescriptor *td = [MTLTextureDescriptor new];
++    td.textureType = type;
++    td.pixelFormat = fmt;
++    td.width = w;
++    td.height = h;
++    td.mipmapLevelCount = levels ? levels : 1;
++    td.usage = usage;
++    td.storageMode = MTLStorageModePrivate;
++    return [s_dev newTextureWithDescriptor:td];
++}
++
+ static id<MTLTexture> make_texture(MTLTextureType type, MTLPixelFormat fmt, uint32_t w, uint32_t h,
+                                    MTLTextureUsage usage)
+ {
+@@ -676,6 +690,7 @@ static void surf_reset(MtSurf *s)
+     MTLPixelFormat fmt;
+     uint32_t used, checked;
+     uint32_t rgen, rk;          /* replacement generation asked, scale (0 = original) */
++    uint32_t levels;            /* mip levels of tex (the title's count, 1 = none) */
+ } MtTex;
+ 
+ const uint32_t *(*nv2a_tex_replace_hook)(const Nv2aTexInfo *ti, uint32_t *k);
+@@ -827,6 +842,25 @@ static int is_bc(MTLPixelFormat f)
+ }
+ 
+ /* `bytes` at `src`, rows `row_bytes` apart, into slice `layer` of t. */
++static void tex_upload_level(MtTex *t, const void *src, uint32_t bytes, uint32_t row_bytes,
++                             uint32_t rows, uint32_t layer, uint32_t level, uint32_t w, uint32_t h)
++{
++    void *dst;
++    size_t at = ring_alloc(bytes, 16, &dst);
++    if (!dst)
++        return;
++    memcpy(dst, src, bytes);
++    [blit() copyFromBuffer:s_f->ring
++              sourceOffset:at
++         sourceBytesPerRow:row_bytes
++       sourceBytesPerImage:(NSUInteger)row_bytes * rows
++                sourceSize:MTLSizeMake(w, h, 1)
++                 toTexture:t->tex
++          destinationSlice:layer
++          destinationLevel:level
++         destinationOrigin:MTLOriginMake(0, 0, 0)];
++}
++
+ static void tex_upload(MtTex *t, const void *src, uint32_t bytes, uint32_t row_bytes,
+                        uint32_t rows, uint32_t layer)
+ {
+@@ -869,10 +903,16 @@ static void tex_fill(MtTex *t, uint32_t va, uint32_t layer)
+     uint32_t color = t->color, w = t->w, h = t->h, pitch = t->pitch;
+     Nv2aTexture nt;
+ 
+-    if (is_bc(t->fmt)) {                                    /* DXT as it is */
+-        uint32_t block = color == 0x0C ? 8 : 16;
+-        tex_upload(t, mem + va, tex_bytes(color, w, h, 0), ((w + 3) / 4) * block, (h + 3) / 4,
+-                   layer);
++    if (is_bc(t->fmt)) {                                    /* DXT as it is, with its levels */
++        uint32_t block = color == 0x0C ? 8 : 16, l, lw = w, lh = h, off = 0;
++        for (l = 0; l < (t->levels ? t->levels : 1); l++) {
++            uint32_t n = tex_bytes(color, lw, lh, 0);
++            tex_upload_level(t, mem + va + off, n, ((lw + 3) / 4) * block, (lh + 3) / 4, layer, l,
++                             lw, lh);
++            off += n;
++            lw = lw > 1 ? lw / 2 : 1;
++            lh = lh > 1 ? lh / 2 : 1;
++        }
+         return;
+     }
+     if (color == 0x12 && pitch && !(pitch & 3) && pitch / 4 >= w) {
+@@ -909,6 +949,8 @@ static void tex_fill(MtTex *t, uint32_t va, uint32_t layer)
+         }
+     }
+     tex_upload(t, s_decode, w * h * 4, w * 4, h, layer);
++    if (t->levels > 1 && !t->face)
++        [blit() generateMipmapsForTexture:t->tex];     /* decoded: the GPU builds the chain */
+ }
+ 
+ static uint64_t fnv64(const uint8_t *p, size_t n, uint64_t h)
+@@ -990,18 +1032,33 @@ static int tex_replace(MtTex *t, uint32_t va)
+ }
+ 
+ /* face: bytes per cube face (cube_face_bytes), 0 for a 2D texture. */
++/* levels: the title's mip count (format [19:16]) for a 2D texture; honoured (RECOMP_VK_MIPS=0 off)
++ * so distant road, kerb and wall textures are minified from their mips instead of point-sampled
++ * from level 0 at 4x (moire). Cubes and linear (pitch) textures keep one level. */
++static int s_mips_on = -1;
+ static id<MTLTexture> tex_get(uint32_t va, uint32_t color, uint32_t w, uint32_t h, uint32_t pitch,
+-                              uint32_t face)
++                              uint32_t face, uint32_t levels)
+ {
+     MtTex *t = NULL, *victim = NULL;
+     uint32_t i, hash;
+     MTLPixelFormat fmt = MTLPixelFormatBGRA8Unorm;
+-    uint32_t layers = face ? 6 : 1, f, size;
++    uint32_t layers = face ? 6 : 1, f, size, maxl = 1, d;
++
++    if (s_mips_on < 0) {
++        const char *e = getenv("RECOMP_VK_MIPS");
++        s_mips_on = !(e && *e == '0');
++    }
++    for (d = w > h ? w : h; d > 1; d >>= 1)
++        maxl++;
++    if (!s_mips_on || face || pitch || levels < 1)
++        levels = 1;
++    if (levels > maxl)
++        levels = maxl;
+ 
+     for (i = s_tex_head[tex_bucket(va, color, w, h)]; i; i = s_tex_next[i - 1]) {
+         MtTex *c = &s_tex[i - 1];
+         if (c->tex && c->va == va && c->color == color && c->w == w && c->h == h
+-            && c->face == face) {
++            && c->face == face && c->levels == levels) {
+             t = c;
+             break;
+         }
+@@ -1045,9 +1102,10 @@ static int tex_replace(MtTex *t, uint32_t va)
+             tex_free(t);
+         t->va = va; t->color = color; t->w = w; t->h = h; t->pitch = pitch; t->fmt = fmt;
+         t->face = face;
++        t->levels = levels;
+         VT("texture %08X fmt %02X %ux%u pitch %u%s\n", va, color, w, h, pitch, face ? " cube" : "");
+-        t->tex = make_texture(face ? MTLTextureTypeCube : MTLTextureType2D, fmt, w, h,
+-                              MTLTextureUsageShaderRead);
++        t->tex = make_texture_levels(face ? MTLTextureTypeCube : MTLTextureType2D, fmt, w, h,
++                                     MTLTextureUsageShaderRead, levels);
+         if (!t->tex) {
+             t->va = t->color = t->w = t->h = t->pitch = t->face = 0;
+             return face ? s_dummy_cube : s_dummy;
+@@ -1067,6 +1125,8 @@ static int tex_replace(MtTex *t, uint32_t va)
+     for (f = 0; f < layers; f++)
+         tex_fill(t, va + f * face, f);
+     size = is_bc(fmt) ? tex_bytes(color, w, h, 0) : w * h * 4;
++    if (levels > 1)
++        size += size / 3;
+     tex_account(t, size * layers);
+     s_hz_tex_ns += hz_now() - upload_start;
+     return t->tex;
+@@ -1281,7 +1341,8 @@ static MTLSamplerAddressMode wrap_mode(uint32_t m)
+     d.magFilter = (key & 0x10000) ? MTLSamplerMinMagFilterNearest : MTLSamplerMinMagFilterLinear;
+     d.minFilter = (key & 0x20000) ? MTLSamplerMinMagFilterNearest : MTLSamplerMinMagFilterLinear;
+     /* Only replaced (HD) textures have mips; the game's own have one level. */
+-    d.mipFilter = MTLSamplerMipFilterLinear;
++    d.mipFilter = (key & 0x40000) ? MTLSamplerMipFilterNotMipmapped
++                                  : MTLSamplerMipFilterLinear;   /* trilinear, LOD bias 0 */
+     if ((key >> 20) & 0x1F)
+         d.maxAnisotropy = (key >> 20) & 0x1F;   /* Options -> Video -> Anisotropic */
+     if (s_nsamplers == 64)
+@@ -1351,7 +1412,7 @@ static void bind_stage(const uint32_t *regs, int i, float scale[2], __strong id<
+             if (any) {
+                 *tex_out = cube_from_surfaces(va, w, h, face, faces);
+             } else {
+-                *tex_out = tex_get(va, color, w, h, 0, face);
++                *tex_out = tex_get(va, color, w, h, 0, face, 1);
+             }
+         }
+     } else if (rt) {
+@@ -1359,13 +1420,16 @@ static void bind_stage(const uint32_t *regs, int i, float scale[2], __strong id<
+         *sampled = rt;
+         rt_scale(w, h, rt->w, rt->h, rt->aa_sx, rt->aa_sy, scale);
+     } else {
+-        *tex_out = tex_get(va, color, w, h, pitch, 0);
++        *tex_out = tex_get(va, color, w, h, pitch, 0, (format >> 16) & 0xF);
+     }
+     addr = regs[base + 2];
+     filter = regs[base + 5];
+     key = (addr & 0xF0F);
+     if (((filter >> 24) & 0xF) == 1) key |= 0x10000;
+     if (((filter >> 16) & 0xFF) == 1) key |= 0x20000;
++    if (((filter >> 16) & 0xFF) <= 2 && !rt && *tex_out && (*tex_out).mipmapLevelCount > 1
++        && (*tex_out).width <= w)
++        key |= 0x40000;                         /* title's no-mip filter: level 0 (not HD) */
+     if (!(key & 0x30000) && !rt && *tex_out && (*tex_out).mipmapLevelCount > 1) {
+         int an = nv2a_vk_aniso;                 /* 1 = off; HD textures carry the mips */
+         if (an > 16) an = 16;
+@@ -3434,6 +3498,26 @@ static void mtl_flip_inner(void)
+             rescale_surfaces(s_scale);
+         }
+     }
++    {   /* RECOMP_GL_DUMP_AT=<secs>,<count>: <count> consecutive frames from <secs> after the
++         * first flip (static-scene diffs: two frames of a still scene must match). */
++        static double at = -2, t0;
++        static int left;
++        if (at == -2) {
++            const char *e = getenv("RECOMP_GL_DUMP_AT");
++            at = e ? atof(e) : -1;
++            left = (e && strchr(e, ',')) ? atoi(strchr(e, ',') + 1) : 8;
++            t0 = CACurrentMediaTime();
++        }
++        if (at >= 0 && left > 0 && CACurrentMediaTime() - t0 >= at) {
++            if (s && s_drew_any) {
++                char path[320];
++                snprintf(path, sizeof path, "%sat%05u.bmp", dump_prefix[0] ? dump_prefix : "f", s_frame);
++                dump_surface(s, path);
++                s_ft_dumped = 1;
++                left--;
++            }
++        }
++    }
+     if (s && s_drew_any && dump_every && ((s_frame % (uint32_t)dump_every) == 0
+                                           || (s_inst_alt && s_frame % (uint32_t)dump_every == 1))) {
+         char path[320];

@@ -1,0 +1,417 @@
+From 557cc876e3e1d706b9679bbe63d96b330f2c054e Mon Sep 17 00:00:00 2001
+From: LeoDeadware <351117497+LeoDeadware@users.noreply.github.com>
+Date: Sat, 7 Nov 2026 11:30:44 +0200
+Subject: [PATCH 09/24] Metal: Options->Video rows (anisotropic 16x, FXAA,
+ resolution scale to 2.5x/native, car reflections)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/apple/apple_main.c                        |  7 +-
+ src/recomp_manual.c                           | 41 +++++++---
+ xboxrecomp/src/nv2a_metal/nv2a_metal.m        | 77 +++++++++++++++++--
+ xboxrecomp/src/nv2a_metal/nv2a_metal_post.inc | 64 +++++++++++++++
+ 4 files changed, 167 insertions(+), 22 deletions(-)
+
+diff --git a/src/apple/apple_main.c b/src/apple/apple_main.c
+index 0e78a09..41166d1 100644
+--- a/src/apple/apple_main.c
++++ b/src/apple/apple_main.c
+@@ -118,11 +118,8 @@ int nv2a_vk_host_surface(VkInstance inst, VkSurfaceKHR *surface)
+ #include <SDL_metal.h>
+ #include <dispatch/dispatch.h>
+ 
+-#if !defined(NFSU2_VULKAN)
+-/* Metal-only macOS build: the in-game video options (recomp_manual.c) also set these Vulkan
+- * renderer knobs; nv2a_metal reads only nv2a_vk_scale_pct (its own weak copy). */
+-volatile int nv2a_vk_cube_maps, nv2a_vk_fxaa, nv2a_vk_aniso, nv2a_vk_square;
+-#endif
++/* The in-game video options (recomp_manual.c) set the renderer knobs
++ * nv2a_vk_*; nv2a_metal.m holds them (weak copies) in a Metal-only build. */
+ 
+ /* nv2a_metal.m: the window's CAMetalLayer, from a Metal view SDL adds on the
+  * main thread (as for the Vulkan surface). */
+diff --git a/src/recomp_manual.c b/src/recomp_manual.c
+index 49cb5e9..f0db899 100644
+--- a/src/recomp_manual.c
++++ b/src/recomp_manual.c
+@@ -1933,7 +1933,11 @@ void sub_0033518D(void)
+ #define ENVMAP_TABLE    0x003F2AD0u     /* six cube-face view pointers */
+ #define AUDIO_VOLUMES   0x00406CE8u     /* options object +0x48 */
+ 
+-#ifdef NFSU2_VULKAN
++/* The renderer's picture rows: nv2a_vk.c, and on Apple nv2a_metal.m. */
++#if defined(NFSU2_VULKAN) || defined(NFSU2_METAL)
++#  define NFSU2_VIDEO_ROWS 1
++#endif
++#ifdef NFSU2_VIDEO_ROWS
+ extern volatile int nv2a_vk_cube_maps;
+ extern volatile int nv2a_vk_scale_pct;
+ extern volatile int nv2a_vk_fxaa;
+@@ -1949,7 +1953,14 @@ extern void sub_000B51A0_gen(void);
+ extern void sub_0009B720_gen(void);
+ extern void sub_00076A70_gen(void);
+ 
++#ifdef NFSU2_METAL
++/* Metal draws at the screen's own pixels until a step is chosen (up to
++ * 4x on a Retina Mac), so it offers that top step too. */
++static const int s_scale_pct[] = { 100, 150, 200, 250, 400 };
++#else
+ static const int s_scale_pct[] = { 100, 150, 200, 250 };
++#endif
++#define N_SCALE ((int)(sizeof s_scale_pct / sizeof s_scale_pct[0]))
+ static const int s_aniso_lvl[] = { 1, 2, 4, 8, 16 };
+ 
+ /* Options -> Audio rows, top to bottom. */
+@@ -1983,7 +1994,7 @@ typedef struct {
+ 
+ static void refl_changed(void)
+ {
+-#ifdef NFSU2_VULKAN
++#ifdef NFSU2_VIDEO_ROWS
+     nv2a_vk_cube_maps = s_refl;
+ #endif
+ }
+@@ -1993,7 +2004,7 @@ static void vib_changed(void)
+     usb_gamepad_rumble_pct = s_vib_idx * 10;
+ }
+ 
+-#ifdef NFSU2_VULKAN
++#ifdef NFSU2_VIDEO_ROWS
+ static void scale_changed(void)
+ {
+     nv2a_vk_scale_pct = s_scale_pct[s_scale_idx];
+@@ -2011,6 +2022,7 @@ static void picture_changed(void)
+ static const uint32_t s_refl_texts[] = { 0x0000CCFAu, 0x0000063Cu };    /* Off, On */
+ static const uint32_t s_scale_texts[] = {
+     0x2A2A4AB3u, 0x822E4E9Bu, 0xB55E7665u, 0xD3588630u,                 /* 1x .. 2.5x */
++    0xA7A683ACu,                                                        /* 4x (Metal) */
+ };
+ static const uint32_t s_aniso_texts[] = {
+     0x0000CCFAu, 0xB55E7665u, 0xA7A683ACu, 0x6F2C7417u, 0x62925361u,    /* Off, 2x .. 16x */
+@@ -2022,8 +2034,8 @@ static const uint32_t s_vib_texts[] = {
+ };
+ static OptRow s_rows[] = {
+     { 0x8FE9288Eu, s_refl_texts, 2, &s_refl, refl_changed, 0, 0 },     /* Car Reflections */
+-#ifdef NFSU2_VULKAN
+-    { 0x4AC50BCFu, s_scale_texts, 4, &s_scale_idx, scale_changed, 0, 0 }, /* Resolution Scale */
++#ifdef NFSU2_VIDEO_ROWS
++    { 0x4AC50BCFu, s_scale_texts, N_SCALE, &s_scale_idx, scale_changed, 0, 0 }, /* Resolution Scale */
+     { 0x4CD775ACu, s_refl_texts, 2, &s_fxaa, picture_changed, 0, 0 },  /* Anti-Aliasing */
+     { 0x4E57D355u, s_aniso_texts, 5, &s_aniso_idx, picture_changed, 0, 0 }, /* Anisotropic */
+     { 0xA9C27DFDu, s_refl_texts, 2, &s_square, picture_changed, 0, 0 }, /* Square Pixels */
+@@ -2034,11 +2046,11 @@ static OptRow s_rows[] = {
+ 
+ static void options_log(void)
+ {
+-#ifdef NFSU2_VULKAN
++#ifdef NFSU2_VIDEO_ROWS
+     fprintf(stderr, "[options] car reflections %s, resolution scale %d%%%s, anti-aliasing %s,"
+             " anisotropic %dx, square pixels %s, vibration %d%%\n",
+             s_refl ? "on" : "off", s_scale_pct[s_scale_idx],
+-            nv2a_vk_scale_pct ? "" : " (RECOMP_GL_SCALE)", s_fxaa ? "on" : "off",
++            nv2a_vk_scale_pct ? "" : " (RECOMP_GL_SCALE or native)", s_fxaa ? "on" : "off",
+             s_aniso_lvl[s_aniso_idx], s_square ? "on" : "off", s_vib_idx * 10);
+ #else
+     fprintf(stderr, "[options] car reflections %s, vibration %d%%\n",
+@@ -2080,7 +2092,7 @@ void nfsu2_options_load(void)
+             }
+             else if (!strncmp(line, "scale=", 6)) {
+                 int pct = atoi(line + 6);
+-                for (i = 0; i < 4; i++)
++                for (i = 0; i < N_SCALE; i++)
+                     if (s_scale_pct[i] == pct) {
+                         s_scale_idx = i;
+                         s_scale_saved = 1;
+@@ -2091,14 +2103,21 @@ void nfsu2_options_load(void)
+     }
+     refl_changed();
+     vib_changed();
+-#ifdef NFSU2_VULKAN
++#ifdef NFSU2_VIDEO_ROWS
+     {
+         const char *e = getenv("RECOMP_GL_SCALE");
++#ifdef NFSU2_METAL
++        if (!s_scale_saved && !(e && *e)) {
++            /* No step chosen yet: Metal keeps the screen's own resolution
++             * (nv2a_vk_scale_pct 0); the row shows the top step. */
++            s_scale_idx = N_SCALE - 1;
++        } else
++#endif
+         if (!s_scale_saved && e && *e) {
+             /* RECOMP_GL_SCALE stays in charge until the option is changed;
+              * the row shows the nearest step. */
+             double k = strtod(e, NULL), best = 1e9;
+-            for (i = 0; i < 4; i++) {
++            for (i = 0; i < N_SCALE; i++) {
+                 double d = fabs(k * 100.0 - s_scale_pct[i]);
+                 if (d < best) { best = d; s_scale_idx = i; }
+             }
+@@ -2122,7 +2141,7 @@ static void options_save(void)
+     fprintf(f, "reflections=%d\nvibration=%d\n", s_refl, s_vib_idx * 10);
+     if (s_scale_saved)
+         fprintf(f, "scale=%d\n", s_scale_pct[s_scale_idx]);
+-#ifdef NFSU2_VULKAN
++#ifdef NFSU2_VIDEO_ROWS
+     fprintf(f, "fxaa=%d\naniso=%d\nsquare=%d\n", s_fxaa, s_aniso_lvl[s_aniso_idx], s_square);
+ #endif
+     for (i = 0; i < N_VOLS; i++)
+diff --git a/xboxrecomp/src/nv2a_metal/nv2a_metal.m b/xboxrecomp/src/nv2a_metal/nv2a_metal.m
+index 9ac3d71..403cfde 100644
+--- a/xboxrecomp/src/nv2a_metal/nv2a_metal.m
++++ b/xboxrecomp/src/nv2a_metal/nv2a_metal.m
+@@ -190,6 +190,15 @@ static void frame_begin(void)
+  * linking. Applied at the next flip (rescale_surfaces). */
+ __attribute__((weak)) volatile int nv2a_vk_scale_pct;
+ 
++/* The other Options -> Video rows (recomp_manual.c), as nv2a_vk.c has
++ * them: car reflections (cube stages), anti-aliasing (FXAA in the present
++ * pass), anisotropic level 1..16 (mipmapped textures) and square pixels
++ * (applied at the next flip). Weak, for a build with nv2a_vk.c too. */
++__attribute__((weak)) volatile int nv2a_vk_cube_maps = 1;
++__attribute__((weak)) volatile int nv2a_vk_fxaa = 1;
++__attribute__((weak)) volatile int nv2a_vk_aniso = 16;
++__attribute__((weak)) volatile int nv2a_vk_square = 1;
++
+ /* The visible half-width of a cropped picture, for the title's HUD mover
+  * (NFSU2 src/hud_wide.c); a weak copy for other titles. */
+ __attribute__((weak)) volatile float nfsu2_hud_visible = 1.0f;
+@@ -198,6 +207,7 @@ static void frame_begin(void)
+  * anamorphic 640-wide surfaces, so those get 4/3 the columns and the
+  * 1280-wide front end (aa 2x1) 2/3 -- every surface then has square
+  * pixels on a 16:9 screen. NFSU2_SQUARE=0 off. */
++static int s_square_cur = -1;           /* nv2a_vk_square as applied (flip) */
+ static int square_on(void)
+ {
+     static int on = -1;
+@@ -205,7 +215,9 @@ static int square_on(void)
+         const char *e = getenv("NFSU2_SQUARE");
+         on = xbox_video_widescreen() && !(e && *e == '0');
+     }
+-    return on;
++    if (s_square_cur < 0)
++        s_square_cur = !!nv2a_vk_square;
++    return on && s_square_cur;
+ }
+ 
+ static void stored_size(uint32_t w, uint32_t h, uint32_t *pw, uint32_t *ph)
+@@ -958,6 +970,10 @@ static int tex_replace(MtTex *t, uint32_t va)
+  * (nv2a_metal_post.inc, NFSU2_GAMMA). */
+ static int s_copy_gamma;
+ static id<MTLRenderPipelineState> s_present_pipe;
++/* present() sets it too: Options -> Video -> Anti-Aliasing, FXAA 3.11 in
++ * the source surface's texels, then the gamma curve (fxaa_fs). */
++static int s_copy_fxaa;
++static id<MTLRenderPipelineState> s_fxaa_pipe;
+ static float s_gamma_v[4];
+ 
+ /* src's texels (0,0)-(sw,sh) into dst's rectangle (dx,dy,dw,dh) of slice.
+@@ -982,8 +998,8 @@ static void draw_copy(id<MTLTexture> src, uint32_t sw, uint32_t sh, id<MTLTextur
+     rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+     e = [s_cb renderCommandEncoderWithDescriptor:rp];
+     if (src) {
+-        [e setRenderPipelineState:s_copy_gamma ? s_present_pipe : s_copy_pipe];
+-        if (s_copy_gamma) [e setFragmentBytes:s_gamma_v length:sizeof s_gamma_v atIndex:0];
++        [e setRenderPipelineState:s_copy_fxaa ? s_fxaa_pipe : s_copy_gamma ? s_present_pipe : s_copy_pipe];
++        if (s_copy_gamma || s_copy_fxaa) [e setFragmentBytes:s_gamma_v length:sizeof s_gamma_v atIndex:0];
+         [e setViewport:vp];
+         [e setVertexBytes:uv length:sizeof uv atIndex:0];
+         [e setFragmentTexture:src atIndex:0];
+@@ -1010,8 +1026,8 @@ static void draw_copy_uv(id<MTLTexture> src, uint32_t sw, uint32_t sh, id<MTLTex
+     rp.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 1);
+     rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+     e = [s_cb renderCommandEncoderWithDescriptor:rp];
+-    [e setRenderPipelineState:s_copy_gamma ? s_present_pipe : s_copy_pipe];
+-    if (s_copy_gamma) [e setFragmentBytes:s_gamma_v length:sizeof s_gamma_v atIndex:0];
++    [e setRenderPipelineState:s_copy_fxaa ? s_fxaa_pipe : s_copy_gamma ? s_present_pipe : s_copy_pipe];
++    if (s_copy_gamma || s_copy_fxaa) [e setFragmentBytes:s_gamma_v length:sizeof s_gamma_v atIndex:0];
+     [e setViewport:vp];
+     [e setVertexBytes:uv length:sizeof uv atIndex:0];
+     [e setFragmentTexture:src atIndex:0];
+@@ -1151,6 +1167,8 @@ static MTLSamplerAddressMode wrap_mode(uint32_t m)
+     d.minFilter = (key & 0x20000) ? MTLSamplerMinMagFilterNearest : MTLSamplerMinMagFilterLinear;
+     /* Only replaced (HD) textures have mips; the game's own have one level. */
+     d.mipFilter = MTLSamplerMipFilterLinear;
++    if ((key >> 20) & 0x1F)
++        d.maxAnisotropy = (key >> 20) & 0x1F;   /* Options -> Video -> Anisotropic */
+     if (s_nsamplers == 64)
+         s_nsamplers = 0;                        /* never in practice: 4 x 4 x 4 keys */
+     s_samplers[s_nsamplers].key = key;
+@@ -1209,7 +1227,7 @@ static void bind_stage(const uint32_t *regs, int i, float scale[2], __strong id<
+     s_palette_va = s_batch->pal_va[i];
+     rt = cube ? NULL : surf_find(va);
+     if (cube) {
+-        if (cube_on && (format & 4)) {
++        if (cube_on && nv2a_vk_cube_maps && (format & 4)) {
+             uint32_t face = cube_face_bytes(color, w, h, (format >> 16) & 0xF), f;
+             MtSurf *faces[6];
+             int any = 0;
+@@ -1233,6 +1251,11 @@ static void bind_stage(const uint32_t *regs, int i, float scale[2], __strong id<
+     key = (addr & 0xF0F);
+     if (((filter >> 24) & 0xF) == 1) key |= 0x10000;
+     if (((filter >> 16) & 0xFF) == 1) key |= 0x20000;
++    if (!(key & 0x30000) && !rt && *tex_out && (*tex_out).mipmapLevelCount > 1) {
++        int an = nv2a_vk_aniso;                 /* 1 = off; HD textures carry the mips */
++        if (an > 16) an = 16;
++        if (an > 1) key |= (uint32_t)an << 20;
++    }
+     *smp_out = sampler_get(key);
+ }
+ 
+@@ -2996,6 +3019,38 @@ static void dump_bmp(const char *path, const uint8_t *bgra, uint32_t w, uint32_t
+ }
+ 
+ /* RECOMP_GL_DUMP: read the surface back (waits for the GPU). */
++static void dump_surface(MtSurf *s, const char *path);
++
++/* RECOMP_VK_FXAA=0 or Options -> Video -> Anti-Aliasing Off: a plain copy. */
++static int fxaa_on(void)
++{
++    static int env = -1;
++    if (env < 0) {
++        const char *e = getenv("RECOMP_VK_FXAA");
++        env = !(e && *e == '0');
++    }
++    return env && nv2a_vk_fxaa && s_fxaa_pipe;
++}
++
++/* RECOMP_GL_DUMP: the FXAA'd picture too, at the surface's size
++ * (<prefix>NNNNN_fxaa.bmp), to compare the pass with the plain dump. */
++static void dump_fxaa(MtSurf *s, const char *path)
++{
++    static __strong id<MTLTexture> t;
++    MtSurf tmp;
++    if (!t || t.width != s->pw || t.height != s->ph)
++        t = make_texture(MTLTextureType2D, MTLPixelFormatBGRA8Unorm, s->pw, s->ph,
++                         MTLTextureUsageShaderRead | MTLTextureUsageRenderTarget);
++    if (!t)
++        return;
++    s_copy_fxaa = 1;
++    draw_copy(s->tex, s->pw, s->ph, t, 0, 1, 0, 0, s->pw, s->ph);
++    s_copy_fxaa = 0;
++    tmp = *s;
++    tmp.tex = t;
++    dump_surface(&tmp, path);
++}
++
+ static void dump_surface(MtSurf *s, const char *path)
+ {
+     id<MTLBuffer> buf = [s_dev newBufferWithLength:(NSUInteger)s->pw * s->ph * 4
+@@ -3052,6 +3107,7 @@ static void present(MtSurf *s)
+     if (!drawable)
+         return;
+     s_copy_gamma = s_gamma_on;
++    s_copy_fxaa = fxaa_on();
+     if (s && s_drew_any) {
+         /* The logical aspect (16:9 for a widescreen title), letterboxed. */
+         double lw = (double)s->w / s->aa_sx, lh = (double)s->h / s->aa_sy;
+@@ -3078,6 +3134,7 @@ static void present(MtSurf *s)
+         draw_copy(nil, 0, 0, drawable.texture, 0, 1, 0, 0, ds.width, ds.height);
+     }
+     s_copy_gamma = 0;
++    s_copy_fxaa = 0;
+     skip_indicator(drawable.texture);
+     [s_cb presentDrawable:drawable];
+ }
+@@ -3184,12 +3241,20 @@ static void mtl_flip_inner(void)
+             k = native_scale(s_layer.drawableSize.height);
+         if (k > 0.0 && fabs(k - s_scale) > 0.01)
+             rescale_surfaces(k);
++        else if (s_square_cur >= 0 && s_square_cur != !!nv2a_vk_square) {
++            s_square_cur = !!nv2a_vk_square;    /* Square Pixels changed: new stored sizes */
++            rescale_surfaces(s_scale);
++        }
+     }
+     if (s && s_drew_any && dump_every && ((s_frame % (uint32_t)dump_every) == 0
+                                           || (s_inst_alt && s_frame % (uint32_t)dump_every == 1))) {
+         char path[320];
+         snprintf(path, sizeof path, "%s%05u.bmp", dump_prefix, s_frame);
+         dump_surface(s, path);
++        if (fxaa_on()) {
++            snprintf(path, sizeof path, "%s%05u_fxaa.bmp", dump_prefix, s_frame);
++            dump_fxaa(s, path);
++        }
+     }
+     VT("flip %u: surface %08X drew %d\n", s_frame, s ? s->va : 0, s_drew_any);
+     if (!s_headless)
+diff --git a/xboxrecomp/src/nv2a_metal/nv2a_metal_post.inc b/xboxrecomp/src/nv2a_metal/nv2a_metal_post.inc
+index 85548f0..a998854 100644
+--- a/xboxrecomp/src/nv2a_metal/nv2a_metal_post.inc
++++ b/xboxrecomp/src/nv2a_metal/nv2a_metal_post.inc
+@@ -69,6 +69,69 @@ static const char *post_msl(void)
+         "    c.rgb = pow(max(c.rgb, 0.0), float3(g.x)) * g.yzw;\n"
+         "    return c;\n"
+         "}\n"
++        /* present with FXAA 3.11 (quality preset, 8 search steps, nv2a_vk.c's
++         * s_pp_fs) in the source's texels, then the gamma curve */
++        "static float L(float3 c) { return dot(c, float3(0.299, 0.587, 0.114)); }\n"
++        "fragment float4 fxaa_fs(QOut in [[stage_in]], texture2d<float> t [[texture(0)]],\n"
++        "                        sampler s [[sampler(0)]], constant float4& g [[buffer(0)]]) {\n"
++        "    const float Q[8] = { 1.0, 1.0, 1.0, 1.5, 2.0, 2.0, 4.0, 8.0 };\n"
++        "    float2 uv = in.uv, r = 1.0 / float2(t.get_width(), t.get_height());\n"
++        "#define LO(x, y) L(t.sample(s, uv, level(0.0), int2(x, y)).rgb)\n"
++        "#define LAT(p) L(t.sample(s, p, level(0.0)).rgb)\n"
++        "    float4 cM = t.sample(s, uv, level(0.0));\n"
++        "    float lM = L(cM.rgb), lD = LO(0, 1), lU = LO(0, -1), lL = LO(-1, 0), lR = LO(1, 0);\n"
++        "    float mx = max(lM, max(max(lD, lU), max(lL, lR)));\n"
++        "    float mn = min(lM, min(min(lD, lU), min(lL, lR)));\n"
++        "    float range = mx - mn;\n"
++        "    float3 o;\n"
++        "    if (range < max(0.0312, mx * 0.125)) {\n"
++        "        o = cM.rgb;\n"
++        "    } else {\n"
++        "        float lDL = LO(-1, 1), lUR = LO(1, -1), lUL = LO(-1, -1), lDR = LO(1, 1);\n"
++        "        float lDU = lD + lU, lLR = lL + lR;\n"
++        "        float lLc = lDL + lUL, lDc = lDL + lDR, lRc = lDR + lUR, lUc = lUR + lUL;\n"
++        "        float eH = abs(-2.0 * lL + lLc) + abs(-2.0 * lM + lDU) * 2.0 + abs(-2.0 * lR + lRc);\n"
++        "        float eV = abs(-2.0 * lU + lUc) + abs(-2.0 * lM + lLR) * 2.0 + abs(-2.0 * lD + lDc);\n"
++        "        bool hor = eH >= eV;\n"
++        "        float l1 = hor ? lU : lL, l2 = hor ? lD : lR;\n"
++        "        float g1 = l1 - lM, g2 = l2 - lM;\n"
++        "        bool steep1 = abs(g1) >= abs(g2);\n"
++        "        float gs = 0.25 * max(abs(g1), abs(g2));\n"
++        "        float st = hor ? r.y : r.x, avg;\n"
++        "        if (steep1) { st = -st; avg = 0.5 * (l1 + lM); } else avg = 0.5 * (l2 + lM);\n"
++        "        float2 cur = uv;\n"
++        "        if (hor) cur.y += st * 0.5; else cur.x += st * 0.5;\n"
++        "        float2 off = hor ? float2(r.x, 0.0) : float2(0.0, r.y);\n"
++        "        float2 uv1 = cur - off, uv2 = cur + off;\n"
++        "        float e1 = LAT(uv1) - avg, e2 = LAT(uv2) - avg;\n"
++        "        bool r1 = abs(e1) >= gs, r2 = abs(e2) >= gs;\n"
++        "        if (!r1) uv1 -= off;\n"
++        "        if (!r2) uv2 += off;\n"
++        "        for (int i = 2; i < 8 && !(r1 && r2); i++) {\n"
++        "            if (!r1) e1 = LAT(uv1) - avg;\n"
++        "            if (!r2) e2 = LAT(uv2) - avg;\n"
++        "            r1 = abs(e1) >= gs; r2 = abs(e2) >= gs;\n"
++        "            if (!r1) uv1 -= off * Q[i];\n"
++        "            if (!r2) uv2 += off * Q[i];\n"
++        "        }\n"
++        "        float d1 = hor ? uv.x - uv1.x : uv.y - uv1.y;\n"
++        "        float d2 = hor ? uv2.x - uv.x : uv2.y - uv.y;\n"
++        "        bool dir1 = d1 < d2;\n"
++        "        float px = -min(d1, d2) / (d1 + d2) + 0.5;\n"
++        "        bool ok = ((dir1 ? e1 : e2) < 0.0) != (lM < avg);\n"
++        "        float fin = ok ? px : 0.0;\n"
++        "        float la = (1.0 / 12.0) * (2.0 * (lDU + lLR) + lLc + lRc);\n"
++        "        float s1 = clamp(abs(la - lM) / range, 0.0, 1.0);\n"
++        "        float s2 = (-2.0 * s1 + 3.0) * s1 * s1;\n"
++        "        fin = max(fin, s2 * s2 * 0.75);\n"
++        "        float2 u2 = uv;\n"
++        "        if (hor) u2.y += fin * st; else u2.x += fin * st;\n"
++        "        o = t.sample(s, u2, level(0.0)).rgb;\n"
++        "    }\n"
++        "#undef LO\n"
++        "#undef LAT\n"
++        "    return float4(pow(max(o, 0.0), float3(g.x)) * g.yzw, 1.0);\n"
++        "}\n"
+         "struct PostP { float near_, far_, w, h, strength, radius, debug, bloom, fade_m, k; };\n"
+         "static float lin(float z, constant PostP& p) {\n"
+         "    return p.near_ / max(1.0 - z * (1.0 - p.near_ / p.far_), 1e-6);\n"
+@@ -198,6 +261,7 @@ static int post_shaders(void)
+     MTLRenderPipelineDescriptor *d;
+     struct { const char *fs; MTLPixelFormat fmt; id<MTLRenderPipelineState> __strong *out; } P[] = {
+         { "present_fs", MTLPixelFormatBGRA8Unorm, &s_present_pipe },
++        { "fxaa_fs", MTLPixelFormatBGRA8Unorm, &s_fxaa_pipe },
+         { "ao_fs", MTLPixelFormatR8Unorm, &s_ao_pipe },
+         { "aoblur_fs", MTLPixelFormatR8Unorm, &s_aoblur_pipe },
+         { "bright_fs", MTLPixelFormatRGBA16Float, &s_bright_pipe },

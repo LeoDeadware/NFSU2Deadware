@@ -1,0 +1,419 @@
+From d9fad426921e4df0df3e8ee69fafcfa05c128568 Mon Sep 17 00:00:00 2001
+From: LeoDeadware <351117497+LeoDeadware@users.noreply.github.com>
+Date: Sat, 7 Nov 2026 14:24:05 +0200
+Subject: [PATCH 10/24] 60 fps: frame-time metric, HD preload, precise vblank,
+ default 2.0x without SSAO
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+[ftime] per 10 s (flip / GPU / ready histograms) with RECOMP_FPS_LOG=1; HD pack decoded on a
+background thread at start (no first-use PNG decode mid-race); vblank wait ends 1.5 ms early then
+usleeps to the deadline; Metal default resolution scale 200 %, NFSU2_AO default 0 (owner 2026-11-07:
+"залізні 60 fps").
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/apple/apple_textures.m                    | 151 +++++++++++++-----
+ src/recomp_manual.c                           |  11 +-
+ xboxrecomp/src/kernel/kernel_bridge.c         |  24 ++-
+ xboxrecomp/src/nv2a_metal/nv2a_metal.m        |  54 +++++++
+ xboxrecomp/src/nv2a_metal/nv2a_metal_post.inc |   5 +-
+ 5 files changed, 201 insertions(+), 44 deletions(-)
+
+diff --git a/src/apple/apple_textures.m b/src/apple/apple_textures.m
+index b3db8e5..b0a753c 100644
+--- a/src/apple/apple_textures.m
++++ b/src/apple/apple_textures.m
+@@ -7,7 +7,8 @@
+  *                          hashes; tools/hd/census.sh).
+  *   NFSU2_HD=<dir>|0       the HD pack (tools/hd/build_pack.py: <hash>.png +
+  *                          manifest.tsv); default <app>/Contents/Resources/hd
+- *                          when it exists. Pictures load on first use.
++ *                          when it exists. A background thread decodes the
++ *                          pack ahead (NFSU2_HD_PRELOAD=0: on first use).
+  *
+  * Users of the hook register a provider (button prompts, HD packs); the
+  * first that answers wins.
+@@ -58,66 +59,134 @@ void nfsu2_tex_write_png(const char *path, const uint32_t *argb, uint32_t w, uin
+     CGColorSpaceRelease(cs);
+ }
+ 
+-/* ── HD pack ── */
++/* ── HD pack ──
++ * Decoding a PNG costs ~2 ms per 512x512 picture; done on the render thread at first use it made
++ * 50-70 ms hitches mid-race (60 fps budget, owner 2026-11-07). hd_init starts one background thread
++ * that decodes the whole pack ahead (straight-alpha BGRA kept in memory, ~160 MB for the merged
++ * pack); hd_provide takes the decoded copy and decodes synchronously only what the thread has not
++ * reached yet. NFSU2_HD_PRELOAD=0 turns the thread off (decode on first use, as before). */
++typedef struct { uint32_t *px; uint32_t w, h; } HdPic;
+ static NSDictionary<NSNumber *, NSString *> *s_hd;       /* hash -> png path */
+-static uint32_t *s_px;
+-static size_t s_px_cap;
+-static unsigned long s_hd_hits, s_hd_fail;
++static NSMutableDictionary<NSNumber *, NSValue *> *s_pic; /* hash -> HdPic (decoded) */
++static pthread_mutex_t s_pic_mu = PTHREAD_MUTEX_INITIALIZER;
++static unsigned long s_hd_hits, s_hd_fail, s_hd_sync;
+ 
+-static const uint32_t *hd_provide(const Nv2aTexInfo *ti, uint32_t *k)
++static uint32_t *hd_decode(NSString *path, uint32_t *w, uint32_t *h)
+ {
+-    NSString *path = s_hd[@(ti->hash)];
+-    CGImageSourceRef src;
+-    CGImageRef img;
++    CGImageSourceRef src = CGImageSourceCreateWithURL((__bridge CFURLRef)[NSURL fileURLWithPath:path], NULL);
++    CGImageRef img = src ? CGImageSourceCreateImageAtIndex(src, 0, NULL) : NULL;
+     size_t W, H, i;
+-    uint32_t kk;
+-    if (!path)
+-        return NULL;
+-    src = CGImageSourceCreateWithURL((__bridge CFURLRef)[NSURL fileURLWithPath:path], NULL);
+-    img = src ? CGImageSourceCreateImageAtIndex(src, 0, NULL) : NULL;
++    uint32_t *px;
+     if (src) CFRelease(src);
+-    if (!img) { s_hd_fail++; return NULL; }
++    if (!img) return NULL;
+     W = CGImageGetWidth(img); H = CGImageGetHeight(img);
+-    kk = (uint32_t)(W / ti->w);
+-    if (kk < 1 || W != ti->w * kk || H != ti->h * kk) {
+-        CGImageRelease(img);
+-        s_hd_fail++;
+-        return NULL;
+-    }
+-    if (W * H > s_px_cap) {
+-        free(s_px);
+-        s_px_cap = W * H;
+-        s_px = (uint32_t *)malloc(s_px_cap * 4);
+-    }
+-    {
++    px = (W && H && W <= 8192 && H <= 8192) ? (uint32_t *)malloc(W * H * 4) : NULL;
++    if (px) {
+         CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
+-        CGContextRef c = CGBitmapContextCreate(s_px, W, H, 8, W * 4, cs,
++        CGContextRef c = CGBitmapContextCreate(px, W, H, 8, W * 4, cs,
+             kCGImageAlphaPremultipliedFirst | kCGBitmapByteOrder32Little);
+         CGColorSpaceRelease(cs);
+-        if (!c) { CGImageRelease(img); s_hd_fail++; return NULL; }
+-        CGContextSetBlendMode(c, kCGBlendModeCopy);
+-        CGContextDrawImage(c, CGRectMake(0, 0, W, H), img);
+-        CGContextRelease(c);
++        if (c) {
++            CGContextSetBlendMode(c, kCGBlendModeCopy);
++            CGContextDrawImage(c, CGRectMake(0, 0, W, H), img);
++            CGContextRelease(c);
++        } else {
++            free(px);
++            px = NULL;
++        }
+     }
+     CGImageRelease(img);
++    if (!px) return NULL;
+     for (i = 0; i < W * H; i++) {                      /* straight alpha again */
+-        uint32_t p = s_px[i], a = p >> 24;
++        uint32_t p = px[i], a = p >> 24;
+         if (a && a < 255) {
+             uint32_t r = ((p >> 16 & 255) * 255 + a / 2) / a, g = ((p >> 8 & 255) * 255 + a / 2) / a,
+                      b = ((p & 255) * 255 + a / 2) / a;
+-            s_px[i] = a << 24 | (r > 255 ? 255 : r) << 16 | (g > 255 ? 255 : g) << 8 | (b > 255 ? 255 : b);
++            px[i] = a << 24 | (r > 255 ? 255 : r) << 16 | (g > 255 ? 255 : g) << 8 | (b > 255 ? 255 : b);
+         }
+     }
++    *w = (uint32_t)W; *h = (uint32_t)H;
++    return px;
++}
++
++/* Stores a decoded picture unless one is there already; returns the stored one. */
++static HdPic hd_store(NSNumber *key, HdPic pic)
++{
++    NSValue *v;
++    pthread_mutex_lock(&s_pic_mu);
++    v = s_pic[key];
++    if (v) {
++        HdPic old;
++        [v getValue:&old];
++        free(pic.px);
++        pic = old;
++    } else
++        s_pic[key] = [NSValue valueWithBytes:&pic objCType:@encode(HdPic)];
++    pthread_mutex_unlock(&s_pic_mu);
++    return pic;
++}
++
++static void *hd_preload(void *arg)
++{
++    NSDictionary<NSNumber *, NSString *> *hd = s_hd;
++    double t0 = CFAbsoluteTimeGetCurrent();
++    unsigned long n = 0;
++    size_t bytes = 0;
++    (void)arg;
++    pthread_set_qos_class_self_np(QOS_CLASS_UTILITY, 0);
++    for (NSNumber *key in hd) {
++        @autoreleasepool {
++            HdPic pic = {0};
++            pthread_mutex_lock(&s_pic_mu);
++            BOOL have = s_pic[key] != nil;
++            pthread_mutex_unlock(&s_pic_mu);
++            if (have || !(pic.px = hd_decode(hd[key], &pic.w, &pic.h)))
++                continue;
++            hd_store(key, pic);
++            n++;
++            bytes += (size_t)pic.w * pic.h * 4;
++        }
++    }
++    fprintf(stderr, "[hd] preloaded %lu pictures, %zu MB, in %.0f ms\n", n, bytes >> 20,
++            (CFAbsoluteTimeGetCurrent() - t0) * 1000);
++    return NULL;
++}
++
++static const uint32_t *hd_provide(const Nv2aTexInfo *ti, uint32_t *k)
++{
++    NSNumber *key = @(ti->hash);
++    NSString *path = s_hd[key];
++    NSValue *v;
++    HdPic pic = {0};
++    uint32_t kk;
++    if (!path)
++        return NULL;
++    pthread_mutex_lock(&s_pic_mu);
++    v = s_pic[key];
++    if (v) [v getValue:&pic];
++    pthread_mutex_unlock(&s_pic_mu);
++    if (!v) {
++        if (!(pic.px = hd_decode(path, &pic.w, &pic.h))) { s_hd_fail++; return NULL; }
++        pic = hd_store(key, pic);
++        s_hd_sync++;
++    }
++    kk = pic.w / ti->w;
++    if (kk < 1 || pic.w != ti->w * kk || pic.h != ti->h * kk) {
++        s_hd_fail++;
++        return NULL;
++    }
+     if (!s_hd_hits++)
+-        fprintf(stderr, "[hd] first HD texture %016llx %ux%u -> %zux%zu\n",
+-                (unsigned long long)ti->hash, ti->w, ti->h, W, H);
++        fprintf(stderr, "[hd] first HD texture %016llx %ux%u -> %ux%u\n",
++                (unsigned long long)ti->hash, ti->w, ti->h, pic.w, pic.h);
++    if (s_hd_sync && !(s_hd_sync & (s_hd_sync - 1)) && !v)
++        fprintf(stderr, "[hd] %lu pictures decoded on first use (preload not there yet)\n", s_hd_sync);
+     *k = kk;
+-    return s_px;
++    return pic.px;
+ }
+ 
+ static void hd_init(void)
+ {
+-    const char *e = getenv("NFSU2_HD");
++    const char *e = getenv("NFSU2_HD"), *pre = getenv("NFSU2_HD_PRELOAD");
+     NSString *dir = nil, *man;
+     NSMutableDictionary *idx = [NSMutableDictionary new];
+     if (e && (!strcmp(e, "0") || !*e))
+@@ -147,10 +216,16 @@ static void hd_init(void)
+         idx[@(h)] = [dir stringByAppendingPathComponent:[f[0] stringByAppendingString:@".png"]];
+     }
+     s_hd = idx;
++    s_pic = [NSMutableDictionary new];
+     if (!getenv("RECOMP_GL_TEX_MB"))
+         setenv("RECOMP_GL_TEX_MB", "1536", 1);
+     nfsu2_tex_add_provider(hd_provide);
+     fprintf(stderr, "[hd] %lu HD textures in %s\n", (unsigned long)idx.count, dir.UTF8String);
++    if (!(pre && !strcmp(pre, "0"))) {
++        pthread_t t;
++        if (pthread_create(&t, NULL, hd_preload, NULL) == 0)
++            pthread_detach(t);
++    }
+ }
+ 
+ static const uint32_t *replace(const Nv2aTexInfo *ti, uint32_t *k)
+diff --git a/src/recomp_manual.c b/src/recomp_manual.c
+index f0db899..7c226cc 100644
+--- a/src/recomp_manual.c
++++ b/src/recomp_manual.c
+@@ -2108,9 +2108,14 @@ void nfsu2_options_load(void)
+         const char *e = getenv("RECOMP_GL_SCALE");
+ #ifdef NFSU2_METAL
+         if (!s_scale_saved && !(e && *e)) {
+-            /* No step chosen yet: Metal keeps the screen's own resolution
+-             * (nv2a_vk_scale_pct 0); the row shows the top step. */
+-            s_scale_idx = N_SCALE - 1;
++            /* No step chosen yet: 200% (Head/owner 2026-11-07: "2.0x", the
++             * variant with GPU p99 <= 16.7 ms in the scripted race with the
++             * HD pack on an M1 Pro, tools/dev/ftime_gate.sh). Owner
++             * 2026-11-07: "залізні 60 fps". Was the screen's own resolution
++             * (~4x, 8-38 missed vsyncs per 10 s). */
++            for (i = 0; i < N_SCALE; i++)
++                if (s_scale_pct[i] == 200) s_scale_idx = i;
++            nv2a_vk_scale_pct = 200;
+         } else
+ #endif
+         if (!s_scale_saved && e && *e) {
+diff --git a/xboxrecomp/src/kernel/kernel_bridge.c b/xboxrecomp/src/kernel/kernel_bridge.c
+index 6b08d94..8ce76b3 100644
+--- a/xboxrecomp/src/kernel/kernel_bridge.c
++++ b/xboxrecomp/src/kernel/kernel_bridge.c
+@@ -25,6 +25,9 @@
+  *   different parameter layouts (pointer vs value), so each needs its own bridge.
+  */
+ 
++#ifndef _WIN32
++#include <unistd.h>
++#endif
+ #include "kernel.h"
+ #include "xbox_memory_layout.h"
+ #include "guest_vmem.h"
+@@ -2914,13 +2917,26 @@ void xbox_vblank_report(double dt, char *buf, size_t n)
+     last = c;
+ }
+ 
+-/* How long the timer thread may sleep before the next vblank is due. */
++/* How long the timer thread may sleep before the next vblank is due.
++ * A millisecond wait rounded up woke up to ~1.2 ms late (flip interval p99
++ * 17.9 ms at 59.94 Hz: the Mac's 60 fps budget, owner 2026-11-07), so the
++ * wait ends VB_FINE_US early and kernel_vblank_tick sleeps the rest to the
++ * microsecond (POSIX; Windows keeps the millisecond wait). */
++#ifndef _WIN32
++#define VB_FINE_US 1500
++#endif
+ static DWORD kernel_vblank_wait_ms(void)
+ {
+     long long d = s_vb_next_us - vb_now_us();
++#ifdef VB_FINE_US
++    if (d <= VB_FINE_US)
++        return 0;
++    d = (d - VB_FINE_US + 999) / 1000;
++#else
+     if (d <= 0)
+         return 1;
+     d = (d + 999) / 1000;
++#endif
+     return d > 10 ? 10 : (DWORD)d;
+ }
+ 
+@@ -2937,6 +2953,12 @@ static void kernel_vblank_tick(void)
+     now = vb_now_us();
+     if (!s_vb_next_us)
+         s_vb_next_us = now;
++#ifdef VB_FINE_US
++    if (now < s_vb_next_us && s_vb_next_us - now <= VB_FINE_US) {
++        usleep((useconds_t)(s_vb_next_us - now));
++        now = vb_now_us();
++    }
++#endif
+     if (now < s_vb_next_us)
+         return;
+     if (now - s_vb_next_us > VBLANK_PERIOD_US / 2)
+diff --git a/xboxrecomp/src/nv2a_metal/nv2a_metal.m b/xboxrecomp/src/nv2a_metal/nv2a_metal.m
+index 403cfde..37b7027 100644
+--- a/xboxrecomp/src/nv2a_metal/nv2a_metal.m
++++ b/xboxrecomp/src/nv2a_metal/nv2a_metal.m
+@@ -120,6 +120,36 @@ static uint64_t hz_now(void)
+  * windows only when FPS diagnostics are requested; never wait for the GPU. */
+ static pthread_mutex_t s_gpu_stats_lock = PTHREAD_MUTEX_INITIALIZER;
+ static double s_gpu_ms, s_gpu_max_ms;
++/* Frame-time metric (RECOMP_FPS_LOG=1, "[ftime]" with each "[fps]" line): flip = time between the
++ * game's flips (its vblank is emulated at 59.94 Hz, so a frame that misses its vblank shows as an
++ * interval > 1.5 periods = "missed vsync"; the layer presents without display sync, so drawables
++ * carry no presentedTime); gpu = each frame's command buffer GPU time (the budget: <= 16.7 ms);
++ * ready = time between consecutive frames' GPU completions = when the display can show each new frame
++ * (> 25 ms: the display repeats a frame = missed vsync).
++ * Frames stalled by our own RECOMP_GL_DUMP are not counted. Histograms in 0.1 ms bins to 100 ms. */
++#define FT_BINS 1000
++typedef struct { uint32_t hist[FT_BINS + 1]; uint32_t n, missed, dropped, over; double max; } FtStat;
++static pthread_mutex_t s_ft_lock = PTHREAD_MUTEX_INITIALIZER;
++static FtStat s_ft_gpu, s_ft_flip, s_ft_ready;
++static double s_ft_last_end;
++static int s_ft_dumped;            /* this flip wrote a dump: its present and the next flip are skipped */
++static void ft_add(FtStat *f, double ms)
++{
++    int b = (int)(ms * 10.0);
++    f->hist[b < 0 ? 0 : b > FT_BINS ? FT_BINS : b]++;
++    f->n++;
++    if (ms > f->max) f->max = ms;
++    if (ms > 16.7) f->over++;
++    if (ms > 25.0) f->missed++;
++}
++static double ft_pct(const FtStat *f, double q)
++{
++    uint32_t want = (uint32_t)(f->n * q), acc = 0;
++    for (int b = 0; b <= FT_BINS; b++)
++        if ((acc += f->hist[b]) > want)
++            return b / 10.0 + 0.05;
++    return f->max;
++}
+ static uint64_t s_gpu_samples;
+ 
+ static void cb_new(void)
+@@ -148,6 +178,12 @@ static void watch_errors(id<MTLCommandBuffer> cb)
+                 if (ms > s_gpu_max_ms) s_gpu_max_ms = ms;
+                 s_gpu_samples++;
+                 pthread_mutex_unlock(&s_gpu_stats_lock);
++                pthread_mutex_lock(&s_ft_lock);
++                ft_add(&s_ft_gpu, ms);
++                if (s_ft_last_end > 0.0)
++                    ft_add(&s_ft_ready, (b.GPUEndTime - s_ft_last_end) * 1000.0);
++                s_ft_last_end = b.GPUEndTime;
++                pthread_mutex_unlock(&s_ft_lock);
+             }
+         }
+     }];
+@@ -3174,6 +3210,12 @@ static void mtl_flip_inner(void)
+         uint64_t now = hz_now();
+         if (last_ns) {
+             uint64_t dt = now - last_ns;
++            if (!s_ft_dumped) {
++                pthread_mutex_lock(&s_ft_lock);
++                ft_add(&s_ft_flip, dt / 1e6);
++                pthread_mutex_unlock(&s_ft_lock);
++            }
++            s_ft_dumped = 0;
+             if (now - window_ns > 10000000000ull) { window_ns = now; lines = 0; }
+             if (dt > 50000000ull && lines++ < 30)
+                 fprintf(stderr, "[hitch] frame %u: %.0f ms -- %u programs compiled (%.0f ms),"
+@@ -3205,6 +3247,17 @@ static void mtl_flip_inner(void)
+                 xbox_vblank_report(dt, vb, sizeof vb);
+                 fprintf(stderr, "[fps] %.1f fps (frame %u), %s\n",
+                         (s_frame - last_frame) / dt, s_frame, vb);
++                pthread_mutex_lock(&s_ft_lock);
++                fprintf(stderr, "[ftime] flip: %u frames, p50 %.1f p99 %.1f max %.1f ms, missed vsync %u;"
++                        " gpu: p50 %.1f p99 %.1f max %.1f ms, over 16.7 ms %u;"
++                        " ready: p99 %.1f max %.1f ms, missed vsync %u\n",
++                        s_ft_flip.n, ft_pct(&s_ft_flip, 0.5), ft_pct(&s_ft_flip, 0.99), s_ft_flip.max,
++                        s_ft_flip.missed, ft_pct(&s_ft_gpu, 0.5), ft_pct(&s_ft_gpu, 0.99), s_ft_gpu.max,
++                        s_ft_gpu.over, ft_pct(&s_ft_ready, 0.99), s_ft_ready.max, s_ft_ready.missed);
++                memset(&s_ft_gpu, 0, sizeof s_ft_gpu);
++                memset(&s_ft_ready, 0, sizeof s_ft_ready);
++                memset(&s_ft_flip, 0, sizeof s_ft_flip);
++                pthread_mutex_unlock(&s_ft_lock);
+                 pthread_mutex_lock(&s_gpu_stats_lock);
+                 double gpu_ms = s_gpu_ms, gpu_max_ms = s_gpu_max_ms;
+                 uint64_t gpu_samples = s_gpu_samples;
+@@ -3251,6 +3304,7 @@ static void mtl_flip_inner(void)
+         char path[320];
+         snprintf(path, sizeof path, "%s%05u.bmp", dump_prefix, s_frame);
+         dump_surface(s, path);
++        s_ft_dumped = 1;
+         if (fxaa_on()) {
+             snprintf(path, sizeof path, "%s%05u_fxaa.bmp", dump_prefix, s_frame);
+             dump_fxaa(s, path);
+diff --git a/xboxrecomp/src/nv2a_metal/nv2a_metal_post.inc b/xboxrecomp/src/nv2a_metal/nv2a_metal_post.inc
+index a998854..7280c91 100644
+--- a/xboxrecomp/src/nv2a_metal/nv2a_metal_post.inc
++++ b/xboxrecomp/src/nv2a_metal/nv2a_metal_post.inc
+@@ -6,7 +6,8 @@
+  *       (the same curves as the ROTK launcher): original = the game's picture;
+  *       modern = c^(2.2/2.5), the CRT-made picture opened up for an LCD;
+  *       warm = c^(2.5/2.2) with a warm white point.
+- *   NFSU2_AO=1|0        screen-space ambient occlusion on the 3D scene (default 1)
++ *   NFSU2_AO=1|0        screen-space ambient occlusion on the 3D scene (default 0: over the
++ *                       60 fps budget at 2.0x on an M1 Pro, owner 2026-11-07)
+  *   NFSU2_BLOOM=0..1    glow of bright, emissive pixels: neon, lamps, headlights
+  *                       (default 0.35; 0 off)
+  *   NFSU2_POST_DEBUG=1  shows the occlusion term alone (tests)
+@@ -239,7 +240,7 @@ static void post_settings(void)
+         s_gamma_v[0] = 2.5f / 2.2f; s_gamma_v[2] = 0.97f; s_gamma_v[3] = 0.90f; s_gamma_on = 1;
+     }
+     e = getenv("NFSU2_AO");
+-    s_ao_on = !(e && *e == '0');
++    s_ao_on = e && *e == '1';
+     e = getenv("NFSU2_BLOOM");
+     s_bloom_k = e ? (float)atof(e) : 0.35f;
+     if (s_bloom_k < 0) s_bloom_k = 0;

@@ -1,0 +1,35 @@
+From cd7698df71368d3cfb7d5b39fec9a25da24de96d Mon Sep 17 00:00:00 2001
+From: LeoDeadware <351117497+LeoDeadware@users.noreply.github.com>
+Date: Sat, 7 Nov 2026 17:15:27 +0200
+Subject: [PATCH 12/24] default render scale 400% (owner 2026-11-07: 4x works
+ after the pacing fix)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/recomp_manual.c | 12 +++++-------
+ 1 file changed, 5 insertions(+), 7 deletions(-)
+
+diff --git a/src/recomp_manual.c b/src/recomp_manual.c
+index f00ffef..9728ee6 100644
+--- a/src/recomp_manual.c
++++ b/src/recomp_manual.c
+@@ -2109,14 +2109,12 @@ void nfsu2_options_load(void)
+         const char *e = getenv("RECOMP_GL_SCALE");
+ #ifdef NFSU2_METAL
+         if (!s_scale_saved && !(e && *e)) {
+-            /* No step chosen yet: 200% (Head/owner 2026-11-07: "2.0x", the
+-             * variant with GPU p99 <= 16.7 ms in the scripted race with the
+-             * HD pack on an M1 Pro, tools/dev/ftime_gate.sh). Owner
+-             * 2026-11-07: "залізні 60 fps". Was the screen's own resolution
+-             * (~4x, 8-38 missed vsyncs per 10 s). */
++            /* No step chosen yet: 400% (owner 2026-11-07 after the pacing
++             * fix: "вручну поставив resolutions scaling 4x ... працює ок",
++             * Head: 4x stays the default; was 200%). */
+             for (i = 0; i < N_SCALE; i++)
+-                if (s_scale_pct[i] == 200) s_scale_idx = i;
+-            nv2a_vk_scale_pct = 200;
++                if (s_scale_pct[i] == 400) s_scale_idx = i;
++            nv2a_vk_scale_pct = 400;
+         } else
+ #endif
+         if (!s_scale_saved && e && *e) {

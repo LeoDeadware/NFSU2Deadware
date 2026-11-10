@@ -1,0 +1,247 @@
+From 4008c7a3be81b89eff7a1bb62f4e259c4a691d17 Mon Sep 17 00:00:00 2001
+From: LeoDeadware <351117497+LeoDeadware@users.noreply.github.com>
+Date: Sat, 7 Nov 2026 19:24:48 +0200
+Subject: [PATCH 14/24] =?UTF-8?q?16:10=20without=20bars=20(v1.0.1,=20owner?=
+ =?UTF-8?q?=202026-11-07=20"=D1=87=D0=BE=D1=80=D0=BD=D1=96=20=D1=81=D0=BC?=
+ =?UTF-8?q?=D1=83=D0=B3=D0=B8"):=20fullscreen=20=3D=20borderless=20window?=
+ =?UTF-8?q?=20over=20the=20whole=20panel=20incl.=20the=20notch=20strip=20(?=
+ =?UTF-8?q?apple=5Fwindow.m;=20NFSU2=5FNOTCH=3D0=20=3D=20SDL's);=20front?=
+ =?UTF-8?q?=20end=20cut=20like=20the=20race=20buffer,=20side=20elements=20?=
+ =?UTF-8?q?moved=20in=20by=20hud=5Fwide,=20movies=20fitted=20whole;=20draw?=
+ =?UTF-8?q?able=20size=20logged?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ CMakeLists.txt                         |  6 ++--
+ src/apple/apple_main.c                 | 40 ++++++++++++++++++++++--
+ src/apple/apple_window.m               | 42 ++++++++++++++++++++++++++
+ src/hud_wide.c                         |  6 ++--
+ src/movie_crop.c                       |  4 +++
+ xboxrecomp/src/nv2a_metal/nv2a_metal.m | 17 +++++++++--
+ 6 files changed, 104 insertions(+), 11 deletions(-)
+ create mode 100644 src/apple/apple_window.m
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 65efad7..ff048d0 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -85,14 +85,14 @@ if(APPLE)
+     enable_language(OBJC)
+     target_sources(${PROJECT_NAME} PRIVATE src/apple/apple_main.c src/apple/apple_game_state.c src/apple/apple_perf.m
+                                            src/apple/apple_keyboard.c src/apple/apple_textures.m
+-                                           src/apple/apple_prompts.m)
++                                           src/apple/apple_prompts.m src/apple/apple_window.m)
+     target_compile_definitions(${PROJECT_NAME} PRIVATE NFSU2_APPLE_TEXTURES=1)
+-    set_source_files_properties(src/apple/apple_textures.m src/apple/apple_prompts.m
++    set_source_files_properties(src/apple/apple_textures.m src/apple/apple_prompts.m src/apple/apple_window.m
+                                 PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
+     set_source_files_properties(src/apple/apple_perf.m PROPERTIES COMPILE_OPTIONS "-fobjc-arc"
+                                 INCLUDE_DIRECTORIES "${XBOXRECOMP_DIR}/src/apu")
+     target_link_libraries(${PROJECT_NAME} PRIVATE "-framework Foundation" "-framework CoreGraphics"
+-                          "-framework ImageIO" "-framework CoreText")
++                          "-framework ImageIO" "-framework CoreText" "-framework AppKit")
+ endif()
+ 
+ # iOS app: SDL's UIKit glue runs apple_main.c's main as SDL_main; Vulkan via
+diff --git a/src/apple/apple_main.c b/src/apple/apple_main.c
+index 41166d1..4eeec48 100644
+--- a/src/apple/apple_main.c
++++ b/src/apple/apple_main.c
+@@ -27,6 +27,41 @@
+ #include <unistd.h>
+ 
+ #include <TargetConditionals.h>
++#if !TARGET_OS_IPHONE
++#include <SDL_syswm.h>
++void apple_window_full_panel(void *nswindow);   /* apple_window.m */
++void apple_window_restore(void);
++int apple_window_notch_on(void);
++static void full_panel(SDL_Window *w)
++{
++    SDL_SysWMinfo i;
++    SDL_VERSION(&i.version);
++    if (w && SDL_GetWindowWMInfo(w, &i) && i.subsystem == SDL_SYSWM_COCOA)
++        apple_window_full_panel((void *)i.info.cocoa.window);
++}
++static int s_full;
++/* Fullscreen: a borderless window over the whole panel (apple_window.m), or SDL's
++ * (NFSU2_NOTCH=0). */
++static void set_full(SDL_Window *w, int on)
++{
++    if (!w)
++        return;
++    s_full = on;
++    if (!apple_window_notch_on()) {
++        SDL_SetWindowFullscreen(w, on ? SDL_WINDOW_FULLSCREEN_DESKTOP : 0);
++        return;
++    }
++    if (on) {
++        SDL_SetWindowBordered(w, SDL_FALSE);
++        full_panel(w);
++    } else {
++        apple_window_restore();
++        SDL_SetWindowBordered(w, SDL_TRUE);
++        SDL_SetWindowSize(w, 1280, 720);
++        SDL_SetWindowPosition(w, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED);
++    }
++}
++#endif
+ #if TARGET_OS_IPHONE
+ #if !defined(NFSU2_VULKAN)
+ #error "iOS renders with Vulkan (MoltenVK): configure with -DNFSU2_VULKAN=ON"
+@@ -340,7 +375,7 @@ int main(int argc, char **argv)
+     {
+         const char *e = getenv("NFSU2_FULLSCREEN");
+         if (s_win && !(e && !strcmp(e, "0")))
+-            SDL_SetWindowFullscreen(s_win, SDL_WINDOW_FULLSCREEN_DESKTOP);
++            set_full(s_win, 1);
+     }
+ #endif
+     s_done_event = SDL_RegisterEvents(1);
+@@ -400,8 +435,7 @@ int main(int argc, char **argv)
+             ios_touch_controllers_changed();
+ #else
+         if (e.type == SDL_KEYDOWN && e.key.keysym.scancode == SDL_SCANCODE_F11 && !e.key.repeat && s_win)
+-            SDL_SetWindowFullscreen(s_win, (SDL_GetWindowFlags(s_win) & SDL_WINDOW_FULLSCREEN_DESKTOP)
+-                                           ? 0 : SDL_WINDOW_FULLSCREEN_DESKTOP);
++            set_full(s_win, !s_full);
+         apple_keyboard_event(&e);
+         if (e.type == SDL_JOYDEVICEADDED || e.type == SDL_JOYDEVICEREMOVED)
+             apple_keyboard_controllers_changed();
+diff --git a/src/apple/apple_window.m b/src/apple/apple_window.m
+new file mode 100644
+index 0000000..01f5781
+--- /dev/null
++++ b/src/apple/apple_window.m
+@@ -0,0 +1,42 @@
++/*
++ * apple_window.m -- fullscreen over the whole panel, the notch strip included
++ * (v1.0.1, owner 2026-11-07 "чорні смуги"). macOS keeps a fullscreen window
++ * (a Space or SDL's non-Space one) below the camera housing: a black strip
++ * at the top of a 16:10 MacBook. Hiding the menu bar and the Dock and giving
++ * the window the screen's whole frame puts the picture there too (the
++ * camera covers a few pixels in the middle). The window is SDL's, borderless
++ * (apple_main.c), not in fullscreen mode: AppKit keeps a fullscreen window's
++ * frame. NFSU2_NOTCH=0: SDL's fullscreen as before.
++ */
++#import <AppKit/AppKit.h>
++
++#include <stdio.h>
++#include <stdlib.h>
++
++void apple_window_full_panel(void *nswindow)
++{
++    NSWindow *w = (__bridge NSWindow *)nswindow;
++    NSScreen *sc;
++    if (!w)
++        return;
++    sc = w.screen ? w.screen : [NSScreen mainScreen];
++    if (!sc)
++        return;
++    [NSApp setPresentationOptions:NSApplicationPresentationHideDock | NSApplicationPresentationHideMenuBar];
++    w.level = NSMainMenuWindowLevel + 1;
++    [w setFrame:sc.frame display:YES];
++    fprintf(stderr, "[apple] window over the whole panel %.0fx%.0f pt (notch %.0f pt)\n",
++            sc.frame.size.width, sc.frame.size.height,
++            [sc respondsToSelector:@selector(safeAreaInsets)] ? sc.safeAreaInsets.top : 0.0);
++}
++
++int apple_window_notch_on(void)
++{
++    const char *e = getenv("NFSU2_NOTCH");
++    return !(e && *e == '0');
++}
++
++void apple_window_restore(void)
++{
++    [NSApp setPresentationOptions:NSApplicationPresentationDefault];
++}
+diff --git a/src/hud_wide.c b/src/hud_wide.c
+index a2a926b..e88d8c7 100644
+--- a/src/hud_wide.c
++++ b/src/hud_wide.c
+@@ -161,7 +161,8 @@ static int hud_quad(const Nv2aRawBatch *rb, const float *attrs, float *rx0, floa
+     uint32_t i;
+     if (rb->xform != 2 || rb->prim != 7 || rb->vertex_count < 4 || !(rb->attr_present & 1u))
+         return 0;
+-    if (rb->surface.width != 640 || rb->surface.aa_sx > 1 || rb->regs[0x30C / 4])
++    if (!((rb->surface.width == 640 && rb->surface.aa_sx <= 1) ||
++          (rb->surface.width == 1280 && rb->surface.aa_sx == 2)) || rb->regs[0x30C / 4])
+         return 0;
+     *rx0 = 1e30f; *rx1 = -1e30f;
+     for (i = 0; i < rb->vertex_count; i++) {
+@@ -295,7 +296,8 @@ void nfsu2_hud_batch(Nv2aRawBatch *rb, float *attrs)
+         return;
+     if (!nv2a_pb_batch_screen_box(box, &flips))
+         return;
+-    half = 0.5f * (float)rb->surface.width * (rb->aa_sx > 0 ? rb->aa_sx : 1.0f);
++    half = rb->surface.width == 1280 ? 640.0f   /* the front end: boxes in real pixels */
++                                     : 0.5f * (float)rb->surface.width * (rb->aa_sx > 0 ? rb->aa_sx : 1.0f);
+     if (flips != s_flips) {
+         if (flips == s_flips + 1)
+             end_frame(half);
+diff --git a/src/movie_crop.c b/src/movie_crop.c
+index aaf9a8f..96786d9 100644
+--- a/src/movie_crop.c
++++ b/src/movie_crop.c
+@@ -26,6 +26,9 @@
+ extern uint32_t nfsu2_movie_row;
+ extern char nfsu2_movie_name[64];
+ 
++/* Movie draws so far: the presenter fits a front-end frame that drew one (no side cut). */
++volatile uint32_t nfsu2_movie_draws;
++
+ #define MOVIE_BYTES (640u * 480u * 4u)
+ 
+ /* Attribute a of vertex i as float4. */
+@@ -88,6 +91,7 @@ static void movie_hook(Nv2aRawBatch *rb, float *attrs)
+     }
+     if (!t || nfsu2_movie_row < t || nfsu2_movie_row >= t + MOVIE_BYTES)
+         return;
++    nfsu2_movie_draws++;
+     if (crop_on() && rb->prim == 7 && rb->vertex_count == 4 && (rb->attr_present & 1u)
+         && player_quad(rb, attrs)) {
+         for (i = 0; i < 4; i++) {
+diff --git a/xboxrecomp/src/nv2a_metal/nv2a_metal.m b/xboxrecomp/src/nv2a_metal/nv2a_metal.m
+index 46ee5ca..12f740c 100644
+--- a/xboxrecomp/src/nv2a_metal/nv2a_metal.m
++++ b/xboxrecomp/src/nv2a_metal/nv2a_metal.m
+@@ -292,6 +292,7 @@ static void frame_begin(void)
+ /* The visible half-width of a cropped picture, for the title's HUD mover
+  * (NFSU2 src/hud_wide.c); a weak copy for other titles. */
+ __attribute__((weak)) volatile float nfsu2_hud_visible = 1.0f;
++__attribute__((weak)) volatile uint32_t nfsu2_movie_draws = 0;   /* movie_crop.c */
+ 
+ /* Square pixels (nv2a_vk.c's s_square): in 16:9 the title renders
+  * anamorphic 640-wide surfaces, so those get 4/3 the columns and the
+@@ -3228,14 +3229,24 @@ static void present(MtSurf *s)
+         double ww = ds.width, wh = ds.height, scale, dw, dh;
+         if (xbox_video_widescreen() && lw < lh * 1.5)
+             lw = lh * 16.0 / 9.0;
++        static uint32_t movie_seen;
++        int movie = nfsu2_movie_draws != movie_seen;
++        movie_seen = nfsu2_movie_draws;
++        {
++            static int said;
++            static double lw0, lh0;
++            if ((ww != lw0 || wh != lh0) && said++ < 8 && ((lw0 = ww), (lh0 = wh), 1))
++                fprintf(stderr, "[metal] drawable %.0fx%.0f (%.3f)\n", ww, wh, ww / wh);
++        }
++        /* v1.0.1 (owner 2026-11-07 "чорні смуги"): the front end (1280x480, aa 2x1) is cut
++         * like the race buffer, its side elements moved in by hud_wide.c; movies stay whole. */
+         if (xbox_apple_screen_crop() && ww / wh < lw / lh - 0.01 &&
+-            s->w == 640 && s->aa_sx <= 1) {
++            ((s->w == 640 && s->aa_sx <= 1) || (s->w == 1280 && s->aa_sx == 2 && !movie))) {
+             /* A screen narrower than the picture (16:10 Macs), the race
+              * buffer (640 wide, no AA: hud_wide.c's test): fill its
+              * height and cut the sides, which hold no HUD (hud_wide.c
+              * moves the HUD to the visible edges). The front end (1280x480,
+-             * aa 2x1) is fitted whole (owner 2026-11-07: the menus were
+-             * cut at the sides). */
++             * aa 2x1) too since v1.0.1, its side elements moved in. */
+             double vis = (ww / wh) / (lw / lh);
+             nfsu2_hud_visible = (float)vis;
+             draw_copy_uv(s->tex, s->pw, s->ph, drawable.texture, 0.5 - 0.5 * vis, 0.5 + 0.5 * vis,

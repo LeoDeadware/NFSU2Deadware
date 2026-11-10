@@ -1,0 +1,212 @@
+From 8aa5b418d0316486f3b621348690b87b1afddf26 Mon Sep 17 00:00:00 2001
+From: LeoDeadware <351117497+LeoDeadware@users.noreply.github.com>
+Date: Sat, 7 Nov 2026 22:48:37 +0200
+Subject: [PATCH 17/24] nv2a_metal: per-frame pass/load/store stats,
+ RECOMP_PASS_TRACE, opt-in upload command buffer (RECOMP_MTL_UPLOAD_CB=1)
+
+4x static start line: 19 passes, 2 split by blits, load 389 MB store 447 MB per frame;
+the back buffer is re-entered ~8 times by the title's own target switches. Uploads in a
+separate command buffer: no change in splits or GPU time (A/B), so off by default.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ xboxrecomp/src/nv2a_metal/nv2a_metal.m | 102 +++++++++++++++++++++----
+ 1 file changed, 89 insertions(+), 13 deletions(-)
+
+diff --git a/xboxrecomp/src/nv2a_metal/nv2a_metal.m b/xboxrecomp/src/nv2a_metal/nv2a_metal.m
+index 0c24bd2..04ec3dd 100644
+--- a/xboxrecomp/src/nv2a_metal/nv2a_metal.m
++++ b/xboxrecomp/src/nv2a_metal/nv2a_metal.m
+@@ -396,14 +396,54 @@ static void end_blit(void)
+     }
+ }
+ 
++static uint32_t s_st_split;     /* RECOMP_DRAW_STATS: render passes ended by a blit */
+ static id<MTLBlitCommandEncoder> blit(void)
+ {
++    if (s_enc) s_st_split++;
+     end_pass();
+     if (!s_blit)
+         s_blit = [s_cb blitCommandEncoder];
+     return s_blit;
+ }
+ 
++/* Texture uploads from guest memory go to a command buffer of their own, committed just before
++ * the frame's: a blit in the frame's buffer ends the render pass, and at 4x every re-entered
++ * pass loads and stores the whole back buffer and its depth (~120 MB). Safe because a texture
++ * is uploaded at most once a frame, before its first draw of the frame (tex_get: checked ==
++ * s_frame returns early), and Metal orders the two buffers' accesses (tracked resources).
++ * RECOMP_MTL_UPLOAD_CB=0: uploads in the frame's buffer (old behaviour). */
++static __strong id<MTLCommandBuffer> s_up_cb;
++static __strong id<MTLBlitCommandEncoder> s_up_blit;
++static int s_up_on = -1;
++static id<MTLBlitCommandEncoder> upload_blit(void)
++{
++    if (s_up_on < 0) {
++        const char *e = getenv("RECOMP_MTL_UPLOAD_CB");
++        s_up_on = e && *e == '1';   /* opt-in: A/B 2026-11-07 showed no gain (splits are not uploads) */
++    }
++    if (!s_up_on)
++        return blit();
++    if (!s_up_blit) {
++        if (!s_up_cb)
++            s_up_cb = [s_queue commandBuffer];
++        s_up_blit = [s_up_cb blitCommandEncoder];
++    }
++    return s_up_blit;
++}
++/* Commits the uploads (before the frame's buffer is committed); returns it or nil. */
++static id<MTLCommandBuffer> upload_commit(void)
++{
++    id<MTLCommandBuffer> cb = s_up_cb;
++    if (s_up_blit) {
++        [s_up_blit endEncoding];
++        s_up_blit = nil;
++    }
++    if (cb)
++        [cb commit];
++    s_up_cb = nil;
++    return cb;
++}
++
+ static void set_viewport(uint32_t pw, uint32_t ph)
+ {
+     MTLViewport vp = { 0, 0, (double)pw, (double)ph, 0.0, 1.0 };
+@@ -434,6 +474,9 @@ static void set_surface_scissor(const uint32_t *r, const MtSurf *s)
+     }
+ }
+ 
++/* RECOMP_DRAW_STATS: passes per frame and attachment traffic (MB loaded / stored) on the tile GPU. */
++static uint32_t s_st_pass;
++static double s_st_ld_mb, s_st_st_mb;
+ static void begin_pass_clear(MtSurf *s, MtDepth *d, uint32_t flags,
+                              const float *color, double depth, uint32_t stencil)
+ {
+@@ -459,6 +502,19 @@ static void begin_pass_clear(MtSurf *s, MtDepth *d, uint32_t flags,
+         rp.stencilAttachment.clearStencil = stencil;
+         rp.stencilAttachment.storeAction = MTLStoreActionStore;
+     }
++    {
++        double cmb = s->pw * (double)s->ph * 4 / 1048576.0, dmb = d ? d->tex.width * (double)d->tex.height * 5 / 1048576.0 : 0;
++        s_st_pass++;
++        {   /* RECOMP_PASS_TRACE=<frame>: every pass of that frame. */
++            static int tf = -2;
++            if (tf == -2) { const char *e = getenv("RECOMP_PASS_TRACE"); tf = e ? atoi(e) : -1; }
++            if (tf >= 0 && (int)s_frame >= tf && (int)s_frame < tf + 2)
++                fprintf(stderr, "[pass] f%u surf %08X %ux%u -> %ux%u depth %08X %ux%u flags %02X\n", s_frame,
++                        s->va, s->w, s->h, s->pw, s->ph, d ? d->va : 0, d ? d->pw : 0, d ? d->ph : 0, flags);
++        }
++        s_st_ld_mb += ((flags & 0xF0) ? 0 : cmb) + ((d && !(flags & 1)) ? dmb : 0);
++        s_st_st_mb += cmb + dmb;
++    }
+     s_enc = [s_cb renderCommandEncoderWithDescriptor:rp];
+     s_rt = s;
+     s_rt_depth = d;
+@@ -533,7 +589,11 @@ static void flush_frame_wait(void)
+     nv2a_mtl_host_gate();
+     cb = s_cb;
+     watch_errors(cb);
+-    [cb commit];
++    {
++        id<MTLCommandBuffer> up = upload_commit();
++        [cb commit];
++        [up waitUntilCompleted];
++    }
+     [cb waitUntilCompleted];
+     s_f->off = 0;
+     cb_new();
+@@ -850,7 +910,7 @@ static void tex_upload_level(MtTex *t, const void *src, uint32_t bytes, uint32_t
+     if (!dst)
+         return;
+     memcpy(dst, src, bytes);
+-    [blit() copyFromBuffer:s_f->ring
++    [upload_blit() copyFromBuffer:s_f->ring
+               sourceOffset:at
+          sourceBytesPerRow:row_bytes
+        sourceBytesPerImage:(NSUInteger)row_bytes * rows
+@@ -869,7 +929,7 @@ static void tex_upload(MtTex *t, const void *src, uint32_t bytes, uint32_t row_b
+     if (!dst)
+         return;
+     memcpy(dst, src, bytes);
+-    [blit() copyFromBuffer:s_f->ring
++    [upload_blit() copyFromBuffer:s_f->ring
+               sourceOffset:at
+          sourceBytesPerRow:row_bytes
+        sourceBytesPerImage:(NSUInteger)row_bytes * rows
+@@ -950,7 +1010,7 @@ static void tex_fill(MtTex *t, uint32_t va, uint32_t layer)
+     }
+     tex_upload(t, s_decode, w * h * 4, w * 4, h, layer);
+     if (t->levels > 1 && !t->face)
+-        [blit() generateMipmapsForTexture:t->tex];     /* decoded: the GPU builds the chain */
++        [upload_blit() generateMipmapsForTexture:t->tex];   /* decoded: the GPU builds the chain */
+ }
+ 
+ static uint64_t fnv64(const uint8_t *p, size_t n, uint64_t h)
+@@ -1018,12 +1078,12 @@ static int tex_replace(MtTex *t, uint32_t va)
+     if (!dst)
+         return 0;
+     memcpy(dst, px, bytes);
+-    [blit() copyFromBuffer:s_f->ring sourceOffset:at sourceBytesPerRow:w * k * 4
++    [upload_blit() copyFromBuffer:s_f->ring sourceOffset:at sourceBytesPerRow:w * k * 4
+        sourceBytesPerImage:bytes sourceSize:MTLSizeMake(w * k, h * k, 1)
+                  toTexture:tex destinationSlice:0 destinationLevel:0
+          destinationOrigin:MTLOriginMake(0, 0, 0)];
+     if (tex.mipmapLevelCount > 1)
+-        [blit() generateMipmapsForTexture:tex];
++        [upload_blit() generateMipmapsForTexture:tex];
+     t->tex = tex;
+     t->fmt = MTLPixelFormatBGRA8Unorm;
+     t->rk = k;
+@@ -1450,6 +1510,12 @@ static void bind_stage(const uint32_t *regs, int i, float scale[2], __strong id<
+     if (!s_feedback)
+         return s_dummy;
+     [blit() copyFromTexture:s->tex toTexture:s_feedback];
++    {
++        static int tf = -2;
++        if (tf == -2) { const char *e = getenv("RECOMP_PASS_TRACE"); tf = e ? atoi(e) : -1; }
++        if (tf >= 0 && (int)s_frame >= tf && (int)s_frame < tf + 2)
++            fprintf(stderr, "[pass] f%u feedback copy %08X %ux%u\n", s_frame, s->va, s->pw, s->ph);
++    }
+     return s_feedback;
+ }
+ 
+@@ -3381,10 +3447,11 @@ static void mtl_flip_inner(void)
+             st = e && *e == '1';
+         }
+         if (st && s_frame - st_frame >= 300) {
+-            fprintf(stderr, "[mtl] per frame: %u draws -> %u draw calls (%u instances appended)\n",
++            fprintf(stderr, "[mtl] per frame: %u draws -> %u draw calls (%u instances appended), %u passes (%u split by blits), load %.0f MB store %.0f MB\n",
+                     s_st_draws / (s_frame - st_frame), s_st_calls / (s_frame - st_frame),
+-                    s_st_inst / (s_frame - st_frame));
+-            s_st_draws = s_st_calls = s_st_inst = 0;
++                    s_st_inst / (s_frame - st_frame), s_st_pass / (s_frame - st_frame), s_st_split / (s_frame - st_frame),
++                    s_st_ld_mb / (s_frame - st_frame), s_st_st_mb / (s_frame - st_frame));
++            s_st_draws = s_st_calls = s_st_inst = s_st_pass = s_st_split = 0; s_st_ld_mb = s_st_st_mb = 0;
+             st_frame = s_frame;
+         }
+     }
+@@ -3539,11 +3606,20 @@ static void mtl_flip_inner(void)
+     cb = s_cb;
+     watch_errors(cb);
+     {
++        /* The frame slot (its ring) is free once both buffers are done with it. */
+         dispatch_semaphore_t sem = s_inflight;
+-        [cb addCompletedHandler:^(id<MTLCommandBuffer> b) {
+-            (void)b;
+-            dispatch_semaphore_signal(sem);
+-        }];
++        id<MTLCommandBuffer> up = s_up_cb;
++        __block int left = up ? 2 : 1;
++        void (^done)(id<MTLCommandBuffer>) = ^(id<MTLCommandBuffer> b) {
++            if (b.status == MTLCommandBufferStatusError)
++                fprintf(stderr, "  [MTL] command buffer failed: %s\n", b.error.localizedDescription.UTF8String);
++            if (__atomic_sub_fetch(&left, 1, __ATOMIC_ACQ_REL) == 0)
++                dispatch_semaphore_signal(sem);
++        };
++        if (up)
++            [up addCompletedHandler:done];
++        [cb addCompletedHandler:done];
++        upload_commit();
+     }
+     [cb commit];
+     s_cb = nil;

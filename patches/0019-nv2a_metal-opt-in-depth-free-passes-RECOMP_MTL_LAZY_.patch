@@ -1,0 +1,149 @@
+From 81985c1a819b1d38d2a83de2fe35c7ad9432659b Mon Sep 17 00:00:00 2001
+From: LeoDeadware <351117497+LeoDeadware@users.noreply.github.com>
+Date: Sun, 8 Nov 2026 00:31:16 +0200
+Subject: [PATCH 19/24] nv2a_metal: opt-in depth-free passes
+ (RECOMP_MTL_LAZY_DEPTH=1), predicted per pass index from the previous frame;
+ not measured yet
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ xboxrecomp/src/nv2a_metal/nv2a_metal.m | 74 +++++++++++++++++++++++---
+ 1 file changed, 68 insertions(+), 6 deletions(-)
+
+diff --git a/xboxrecomp/src/nv2a_metal/nv2a_metal.m b/xboxrecomp/src/nv2a_metal/nv2a_metal.m
+index 905edd0..ae23c89 100644
+--- a/xboxrecomp/src/nv2a_metal/nv2a_metal.m
++++ b/xboxrecomp/src/nv2a_metal/nv2a_metal.m
+@@ -489,6 +489,16 @@ static void set_surface_scissor(const uint32_t *r, const MtSurf *s)
+ /* RECOMP_DRAW_STATS: passes per frame and attachment traffic (MB loaded / stored) on the tile GPU. */
+ static uint32_t s_st_pass;
+ static double s_st_ld_mb, s_st_st_mb;
++/* Depth-free passes (opt-in RECOMP_MTL_LAZY_DEPTH=1, built but not measured yet): a pass that a draw begins
++ * and whose draws, in the previous frame's pass at the same index, never
++ * tested or wrote depth/stencil starts without the depth buffer, so the tile
++ * GPU neither loads nor stores it (33 MB each way at 4x). A draw that does
++ * need it splits the pass and marks the entry, so the next frame keeps it. */
++typedef struct { uint32_t s_va, d_va; uint8_t used; } PassDepth;
++static PassDepth s_pd[2][64];
++static int s_pd_idx = -1, s_pd_draw, s_lazy_on = -1;
++static uint32_t s_pd_n, s_st_nodepth;
++static MtDepth *s_pd_want;
+ static void cube_refresh_from(MtSurf *s);
+ static void begin_pass_clear(MtSurf *s, MtDepth *d, uint32_t flags,
+                              const float *color, double depth, uint32_t stencil)
+@@ -541,6 +551,17 @@ static void begin_pass_clear(MtSurf *s, MtDepth *d, uint32_t flags,
+     s_enc = [s_cb renderCommandEncoderWithDescriptor:rp];
+     s_rt = s;
+     s_rt_depth = d;
++    if (d) s_pd_want = NULL;
++    s_pd_idx = s_pd_n < 64 ? (int)s_pd_n : -1;
++    s_pd_n++;
++    if (s_pd_idx >= 0) {
++        PassDepth *e = &s_pd[s_frame & 1][s_pd_idx];
++        e->s_va = s->va;
++        e->d_va = d ? d->va : s_pd_want ? s_pd_want->va : 0;
++        e->used = d && !s_pd_draw;
++    }
++    if (!d && s_pd_want) s_st_nodepth++;
++    s_pd_draw = 0;
+     s_cur_pipe = nil;
+     s_dyn_valid = 0;
+     bindings_reset();
+@@ -554,6 +575,41 @@ static void begin_pass(MtSurf *s, MtDepth *d)
+     begin_pass_clear(s, d, 0, NULL, 1.0, 0);
+ }
+ 
++/* The depth buffer a draw's pass gets (see PassDepth). */
++static MtDepth *pass_depth(MtSurf *s, MtDepth *d, const uint32_t *r)
++{
++    int need;
++    PassDepth *p;
++    if (!d)
++        return NULL;
++    if (s_lazy_on < 0) { const char *e = getenv("RECOMP_MTL_LAZY_DEPTH"); s_lazy_on = (e && *e == '1'); }
++    if (!s_lazy_on)
++        return d;
++    need = r[0x30C / 4] || r[0x35C / 4] || r[0x32C / 4];
++    if (s_enc && s_rt == s) {
++        if (s_rt_depth == d)
++            return d;
++        if (!s_rt_depth && s_pd_want == d) {
++            if (!need)
++                return NULL;
++            if (s_pd_idx >= 0) s_pd[s_frame & 1][s_pd_idx].used = 1;
++            s_pd_want = NULL;
++            s_pd_draw = 1;
++            return d;
++        }
++    }
++    s_pd_draw = 1;
++    s_pd_want = NULL;
++    if (!need && s_pd_n < 64) {
++        p = &s_pd[(s_frame & 1) ^ 1][s_pd_n];
++        if (p->s_va == s->va && p->d_va == d->va && !p->used) {
++            s_pd_want = d;
++            return NULL;
++        }
++    }
++    return d;
++}
++
+ /* A texture cleared by an empty pass (new surfaces and depth buffers). */
+ static void clear_texture(id<MTLTexture> t, int depth)
+ {
+@@ -2971,7 +3027,7 @@ static int pend_append(const Nv2aRawBatch *b, int changed)
+ static void mtl_draw_raw_inner(const Nv2aRawBatch *b)
+ {
+     MtSurf *s, *sampled[4];
+-    MtDepth *d;
++    MtDepth *d, *dp;
+     MtProg *p;
+     Nv2aPshKey pk;
+     const uint32_t *r = b->regs;
+@@ -3048,7 +3104,8 @@ static void mtl_draw_raw_inner(const Nv2aRawBatch *b)
+         if (cm & 0x01000000u) m |= MTLColorWriteMaskAlpha;
+         key.cmask = m;
+     }
+-    key.depth = d != NULL;
++    dp = pass_depth(s, d, r);
++    key.depth = dp != NULL;
+     key.points = cls == 0;
+     vertex_formats_key(b, key.vfmt);
+     if (s_static_stride)
+@@ -3074,8 +3131,11 @@ static void mtl_draw_raw_inner(const Nv2aRawBatch *b)
+         }
+     }
+     post_scene_hook(s, d, r);
+-    begin_pass(s, d);
+-    if (!apply_dynamic(r, d != NULL, cls))
++    begin_pass(s, dp);
++    s_pd_draw = 0;
++    if (dp && s_pd_idx >= 0 && (r[0x30C / 4] || r[0x35C / 4] || r[0x32C / 4]))
++        s_pd[s_frame & 1][s_pd_idx].used = 1;
++    if (!apply_dynamic(r, dp != NULL, cls))
+         return;
+     s->gen++;
+     if (pipe != s_cur_pipe) {
+@@ -3487,6 +3547,7 @@ static void mtl_flip_inner(void)
+     xbox_apple_limit_frame();
+     pend_flush();
+     s_frame++;
++    s_pd_n = 0;
+     if (s_inst_alt)
+         s_inst_on = s_frame & 1;
+     {
+@@ -3497,11 +3558,12 @@ static void mtl_flip_inner(void)
+             st = e && *e == '1';
+         }
+         if (st && s_frame - st_frame >= 300) {
+-            fprintf(stderr, "[mtl] per frame: %u draws -> %u draw calls (%u instances appended), %u passes (%u split by blits), load %.0f MB store %.0f MB\n",
++            fprintf(stderr, "[mtl] per frame: %u draws -> %u draw calls (%u instances appended), %u passes (%u split by blits, %u without depth), load %.0f MB store %.0f MB\n",
+                     s_st_draws / (s_frame - st_frame), s_st_calls / (s_frame - st_frame),
+                     s_st_inst / (s_frame - st_frame), s_st_pass / (s_frame - st_frame), s_st_split / (s_frame - st_frame),
++                    s_st_nodepth / (s_frame - st_frame),
+                     s_st_ld_mb / (s_frame - st_frame), s_st_st_mb / (s_frame - st_frame));
+-            s_st_draws = s_st_calls = s_st_inst = s_st_pass = s_st_split = 0; s_st_ld_mb = s_st_st_mb = 0;
++            s_st_draws = s_st_calls = s_st_inst = s_st_pass = s_st_split = s_st_nodepth = 0; s_st_ld_mb = s_st_st_mb = 0;
+             st_frame = s_frame;
+         }
+     }

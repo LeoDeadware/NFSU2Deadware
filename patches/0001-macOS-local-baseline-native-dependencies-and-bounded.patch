@@ -1,0 +1,90 @@
+From 41b7ed2f53f99413b00f865aaeb113e598fb3b87 Mon Sep 17 00:00:00 2001
+From: LeoDeadware <351117497+LeoDeadware@users.noreply.github.com>
+Date: Thu, 5 Nov 2026 12:29:40 +0200
+Subject: [PATCH 01/24] macOS local baseline: native dependencies and bounded
+ smoke launch
+
+---
+ src/apple/apple_main.c                | 19 ++++++++++++++++++-
+ xboxrecomp/src/d3d/CMakeLists.txt     |  2 +-
+ xboxrecomp/src/nv2a_vk/CMakeLists.txt |  7 ++++++-
+ 3 files changed, 25 insertions(+), 3 deletions(-)
+
+diff --git a/src/apple/apple_main.c b/src/apple/apple_main.c
+index 7db85f1..05e9352 100644
+--- a/src/apple/apple_main.c
++++ b/src/apple/apple_main.c
+@@ -254,6 +254,7 @@ int main(int argc, char **argv)
+ {
+     pthread_attr_t attr;
+     pthread_t th;
++    Uint64 smoke_deadline = 0;
+ 
+     (void)argc;
+     (void)argv;
+@@ -350,17 +351,33 @@ int main(int argc, char **argv)
+     pthread_attr_destroy(&attr);
+     apple_perf_start();
+ 
++    /* Optional bounded local smoke run; ordinary launches are unchanged. */
++    {
++        const char *limit = getenv("NFSU2_SMOKE_SECONDS");
++        int seconds = limit ? atoi(limit) : 0;
++        if (seconds > 0 && seconds <= 600)
++            smoke_deadline = SDL_GetTicks64() + (Uint64)seconds * 1000;
++    }
++
+ #if !TARGET_OS_IPHONE
+     apple_keyboard_controllers_changed();   /* the keyboard as a pad (NFSU2_KEYBOARD=0: off) */
+ #endif
+     for (;;) {
+         SDL_Event e;
++        if (smoke_deadline && SDL_GetTicks64() >= smoke_deadline) {
++            fprintf(stderr, "[apple] smoke time limit reached\n");
++            fflush(stdout);
++            fflush(stderr);
++            _exit(0);
++        }
+ #if TARGET_OS_IPHONE
+         int got_event = SDL_WaitEventTimeout(&e, 50);
+         ios_touch_update_auto();
+         if (!got_event) continue;
+ #else
+-        if (!SDL_WaitEvent(&e)) continue;
++        if (smoke_deadline) {
++            if (!SDL_WaitEventTimeout(&e, 50)) continue;
++        } else if (!SDL_WaitEvent(&e)) continue;
+ #endif
+         if (e.type == SDL_QUIT) {
+             fprintf(stderr, "[apple] window closed\n");
+diff --git a/xboxrecomp/src/d3d/CMakeLists.txt b/xboxrecomp/src/d3d/CMakeLists.txt
+index ed24fd7..e2fa83f 100644
+--- a/xboxrecomp/src/d3d/CMakeLists.txt
++++ b/xboxrecomp/src/d3d/CMakeLists.txt
+@@ -17,7 +17,7 @@ if(WIN32)
+     # Offline smoke test for the pure format layer (no D3D11 device needed).
+     add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/../../tests/d3d8_smoke
+                      ${CMAKE_CURRENT_BINARY_DIR}/d3d8_smoke)
+-elseif(NINTENDO_SWITCH OR IOS)   # iOS: no libepoxy either
++elseif(NINTENDO_SWITCH OR IOS OR XBOXRECOMP_D3D8_NULL)
+     # No HLE D3D8 renderer on the Switch: titles there draw through the NV2A
+     # executor and src/nv2a_gl.
+     add_library(xbox_d3d8 STATIC d3d8_null.c)
+diff --git a/xboxrecomp/src/nv2a_vk/CMakeLists.txt b/xboxrecomp/src/nv2a_vk/CMakeLists.txt
+index 0c63f68..f36714e 100644
+--- a/xboxrecomp/src/nv2a_vk/CMakeLists.txt
++++ b/xboxrecomp/src/nv2a_vk/CMakeLists.txt
+@@ -42,7 +42,12 @@ else()
+     pkg_check_modules(SDL2 REQUIRED IMPORTED_TARGET sdl2)
+     # The distribution glslang is built with its optimizer (static SPIRV-Tools).
+     target_link_libraries(xbox_nv2a_vk PUBLIC Vulkan::Vulkan PkgConfig::SDL2
+-        SPIRV-Tools-opt SPIRV-Tools stdc++)
++        SPIRV-Tools-opt SPIRV-Tools)
++    if(APPLE)
++        target_link_libraries(xbox_nv2a_vk PUBLIC c++)
++    else()
++        target_link_libraries(xbox_nv2a_vk PUBLIC stdc++)
++    endif()
+ endif()
+ if(NOT MSVC)
+     target_compile_options(xbox_nv2a_vk PRIVATE -Wall -Wextra -Wno-unused-parameter -Wno-missing-field-initializers -O2)

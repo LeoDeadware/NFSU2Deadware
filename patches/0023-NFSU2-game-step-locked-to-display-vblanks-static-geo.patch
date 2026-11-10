@@ -1,0 +1,158 @@
+From 73c1ad823d98066c3f2fb106ddb5204cb9bcbf78 Mon Sep 17 00:00:00 2001
+From: LeoDeadware <351117497+LeoDeadware@users.noreply.github.com>
+Date: Tue, 10 Nov 2026 00:44:55 +0200
+Subject: [PATCH 23/24] NFSU2: game step locked to display vblanks (static
+ geometry no longer moves back and forth); vertex coverage snap only on exact
+ pixel edges (4x stepping)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/recomp_manual.c                        | 82 +++++++++++++++++++++-
+ xboxrecomp/src/nv2a_metal/nv2a_metal_msl.c | 10 ++-
+ 2 files changed, 89 insertions(+), 3 deletions(-)
+
+diff --git a/src/recomp_manual.c b/src/recomp_manual.c
+index b544f19..1f504ff 100644
+--- a/src/recomp_manual.c
++++ b/src/recomp_manual.c
+@@ -422,6 +422,7 @@ extern void nv2a_pb_trap_lock(void);
+  * vblank callback) times 1/60 s, so xbox_after_vblank_dpc below undoes every
+  * other count: 0x4289AC stays a 59.94 Hz counter (clock, timeouts) while the
+  * flips retire at 119.88 Hz. */
++static int step_lock_on(void);
+ int nfsu2_fps_cap_120(void)
+ {
+     static int v = -1;
+@@ -442,7 +443,7 @@ void xbox_after_vblank_dpc(void)
+      * sub_00180AA0/sub_00180AC0), so a 1/120 s frame would still count as
+      * 1/60: halve that floor whenever the title sets it. */
+     float lo = MEMF(0x428EE8);
+-    if (lo > 0.0160f && lo < 0.0170f) {
++    if (!step_lock_on() && lo > 0.0160f && lo < 0.0170f) {
+         static int said;
+         MEMF(0x428EE8) = lo * 0.5f;
+         if (!said++)
+@@ -513,6 +514,16 @@ static void game_clock_sample(void)
+         return;
+     clock_gettime(CLOCK_MONOTONIC, &ts);
+     now = (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
++    {   /* RECOMP_STEP_TRACE=1: per flip, the frame's game step and the vblank count */
++        static int tr = -1;
++        static uint64_t tprev;
++        if (tr < 0) { const char *e = getenv("RECOMP_STEP_TRACE"); tr = e && *e == '1'; }
++        if (tr) {
++            fprintf(stderr, "[step] %.3f ms step %u vb %u steps %u\n", tprev ? (now - tprev) / 1e6 : 0.0,
++                    MEM32(0x4289B4), MEM32(0x4289AC), MEM32(0x4289C0));
++            tprev = now;
++        }
++    }
+     /* 0x428A20: game time total (sub_00184150 adds each step's ticks);
+      * 0x4289C0: steps; 0x4289AC: the title's vblank count. */
+     if (!t0) {
+@@ -529,6 +540,72 @@ static void game_clock_sample(void)
+     }
+ }
+ 
++/* Even game steps (Deadware, owner 2026-11-09: walls, signs and trees move
++ * back and forth while driving). The race/open-world loop sub_0018A8C0 feeds
++ * sub_001890C0 the loop's own CPU-timer period (sub_0004ADA0/sub_0004ADD0 x
++ * 0x3409B8), not vblanks: on the Xbox the loop is paced by the flips, here by
++ * guest-lock and fence waits, so at an even 60 flips/s the world advanced by
++ * 60, 61..76 or ~120 ticks (1/3600 s) a frame -- static geometry jumped against
++ * the camera -- and the 1/60 floor (0x428EE8) lifted short loops, game time
++ * ran 12% fast. Each flip now measures the display interval in whole vblanks
++ * (wall time, accumulated so sampling jitter rounds away) and sets the floor
++ * and the cap (0x3A4C64, x 1/60 s; read only by sub_001890C0) both to it:
++ * every step is exactly that many vblanks (60 ticks at 60 fps, 30 at 120,
++ * 120 at 30) whatever the loop measured. The front end's vblank loop
++ * sub_0018A6A0 gets the same value it counted itself. NFSU2_STEP_LOCK=0 off. */
++static int step_lock_on(void)
++{
++    static int v = -1;
++    if (v < 0) {
++        const char *e = getenv("NFSU2_STEP_LOCK");
++        v = !(e && *e == '0');
++        fprintf(stderr, "[fps] game step locked to the display's vblanks: %s\n", v ? "on" : "off (NFSU2_STEP_LOCK=0)");
++    }
++    return v;
++}
++static void step_lock_flip(void)
++{
++    static uint64_t prev;
++    static double acc;
++    static unsigned last_d;
++    struct timespec ts;
++    uint64_t now;
++    double period = fps_cap_120() ? 1.0 / 119.88 : 1.0 / 59.94;
++    unsigned d;
++    if (!step_lock_on())
++        return;
++    clock_gettime(CLOCK_MONOTONIC, &ts);
++    now = (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
++    if (!prev) {
++        prev = now;
++        return;
++    }
++    acc += (now - prev) / 1e9;
++    prev = now;
++    d = (unsigned)(acc / period + 0.5);
++    if (d < 1u)
++        d = 1u;
++    if (d > 6u * (fps_cap_120() ? 2u : 1u)) {   /* a stall: the original's 100 ms cap */
++        d = 6u * (fps_cap_120() ? 2u : 1u);
++        acc = d * period;
++    }
++    acc -= d * period;
++    if (acc < -period) acc = -period;            /* loop faster than the display: no debt */
++    if (acc > period) acc = period;
++    if (d != last_d) {
++        /* step = cap x (1/60 or PAL 0.02); floor computed the same way so
++         * min(max(t, floor), cap) is exactly it. */
++        float unit = MEM32(0x3A4C50) ? MEMF(0x343EFC) : MEMF(0x341750);
++        float mul = fps_cap_120() ? (float)d * 0.5f : (float)d;   /* x 1/60 s */
++        MEMF(0x3A4C64) = mul;
++        MEMF(0x428EE8) = (float)((double)mul * (double)unit);
++        last_d = d;
++    } else if (MEMF(0x428EE8) != (float)((double)MEMF(0x3A4C64) *
++               (double)(MEM32(0x3A4C50) ? MEMF(0x343EFC) : MEMF(0x341750)))) {
++        last_d = 0;                               /* the title reset its floor: redo next flip */
++    }
++}
++
+ void sub_002F22F0(void)
+ {
+     volatile uint32_t *nv = (volatile uint32_t *)XBOX_PTR(0xFD000000u);
+@@ -539,6 +616,9 @@ void sub_002F22F0(void)
+ 
+     nv2a_pb_trap_lock();
+     nsource = nv[0x400108 / 4];
++    if (nsource && (nv[0x400704 / 4] & 0xFFFFu) == 0x0100u &&
++        (nv[0x400708 / 4] & 0x1Fu) == 1u)
++        step_lock_flip();                           /* every cap mode */
+     if (nsource && (nv[0x400704 / 4] & 0xFFFFu) == 0x0100u && !fps_cap_30()) {
+         uint32_t data = nv[0x400708 / 4];
+         uint32_t bits = (data >> 5) & 7u;
+diff --git a/xboxrecomp/src/nv2a_metal/nv2a_metal_msl.c b/xboxrecomp/src/nv2a_metal/nv2a_metal_msl.c
+index 94f533f..54eacfd 100644
+--- a/xboxrecomp/src/nv2a_metal/nv2a_metal_msl.c
++++ b/xboxrecomp/src/nv2a_metal/nv2a_metal_msl.c
+@@ -105,11 +105,17 @@ static const char s_vs_head[] =
+     "static float2 nv2a_snap(constant VsU& U, float2 sw, float w) {\n"
+     "    if (w <= 0.0) return sw;\n"
+     "    float2 h = float2(0.5) - float2(U.u_surf.w, U.u_snap_y);\n"
+-    "    float2 p = trunc(sw / w * 16.0) / 16.0;\n"
++    "    float2 r = sw / w * 16.0;\n"
++    "    float2 p = trunc(r) / 16.0;\n"
+     "    float2 f = p - floor(p);\n"
+     "    float2 c = f - select(float2(0.0), float2(1.0), f > float2(0.5));\n"
+     "    float2 d = clamp(float2(0.0), c - h, c + h - 1.0 / 64.0);\n"
+-    "    return (p - d) * w;\n"
++    /* Deadware (owner 2026-11-09, trees/walls step at 4x): the coverage
++     * shift is for edges on whole or half title pixels -- full-screen
++     * passes, copies, 2D (on the 1/32 grid: D3D's 0.53125 offset). Applied to every vertex it held a moving vertex
++     * at int+h for 3/4 of each title pixel and then jumped ~3 px at 4x. */
++    "    float2 edge = step(abs(r * 2.0 - round(r * 2.0)), float2(0.004)) * step(abs(f * 2.0 - round(f * 2.0)), float2(0.002));\n"
++    "    return (p - d * edge) * w;\n"
+     "}\n"
+     "static float4 nv2a_clip(constant VsU& U, float3 sw, float w) {\n"
+     "    float z = sw.z * U.u_surf.z;\n"

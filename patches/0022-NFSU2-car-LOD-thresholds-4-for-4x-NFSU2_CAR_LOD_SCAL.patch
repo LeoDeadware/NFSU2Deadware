@@ -1,0 +1,69 @@
+From e80fa4ecf650f95f82325ea1f938bfdbf6c4866f Mon Sep 17 00:00:00 2001
+From: LeoDeadware <351117497+LeoDeadware@users.noreply.github.com>
+Date: Mon, 9 Nov 2026 23:58:02 +0200
+Subject: [PATCH 22/24] NFSU2: car LOD thresholds /4 for 4x
+ (NFSU2_CAR_LOD_SCALE); motion blur composite off by default (NFSU2_BLUR_OFF=0
+ keeps it)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/main.c                             | 21 +++++++++++++++++++++
+ xboxrecomp/src/nv2a_metal/nv2a_metal.m | 13 +++++++++++++
+ 2 files changed, 34 insertions(+)
+
+diff --git a/src/main.c b/src/main.c
+index 577ee19..2d9ab3e 100644
+--- a/src/main.c
++++ b/src/main.c
+@@ -383,6 +383,27 @@ static int game_main(void)
+         }
+     }
+ 
++#if defined(__APPLE__) && !defined(NFSU2_REGION_PAL)
++    /* Car LOD (Deadware, owner 2026-11-09 "машини підвантажуються занадто близько"):
++     * the car renderer sub_0020BC50 starts at the car's minimum LOD and steps down
++     * while its size on screen, in title (480p) pixels, is below the .rdata table
++     * 0x35EBA4 {120, 45, 20, 0} (second set 0x35EBB4 {80, 40, 20, 0}; 0x35EBC4 = 18,
++     * the same measure). Tuned for a 480-line picture; at 4x every switch shows.
++     * NFSU2_CAR_LOD_SCALE (default 4 = the largest render scale) divides them, so
++     * LOD A holds to 1/4 of the size -- the original's switch at 4x. 1 = original. */
++    {
++        const char *e = getenv("NFSU2_CAR_LOD_SCALE");
++        float k = e ? (float)atof(e) : 4.0f;
++        float *t = (float *)((uint8_t *)xbox_GetMemoryBase() + 0x35EBA4);
++        if (k >= 1.0f && k <= 16.0f && t[0] == 120.0f && t[4] == 80.0f && t[8] == 18.0f) {
++            int i;
++            for (i = 0; i < 9; i++)
++                t[i] /= k;
++            printf("[BOOT] car LOD distances x%.1f\n", k);
++        }
++    }
++#endif
++
+     /* The emulated APU. DirectSound's accesses reach it through the MMIO
+      * accessors the DSOUND section is lifted with (regen.sh passes
+      * --mmio-sections DSOUND), so the APU registers stay plain memory and no
+diff --git a/xboxrecomp/src/nv2a_metal/nv2a_metal.m b/xboxrecomp/src/nv2a_metal/nv2a_metal.m
+index 8f5d918..8069eb9 100644
+--- a/xboxrecomp/src/nv2a_metal/nv2a_metal.m
++++ b/xboxrecomp/src/nv2a_metal/nv2a_metal.m
+@@ -3221,6 +3221,19 @@ static void mtl_draw_raw_inner(const Nv2aRawBatch *b)
+     /* Textures first: uploads and copies end the pass. */
+     for (i = 0; i < 4; i++)
+         bind_stage(r, (int)i, tscale[i], &tex[i], &smp[i], &sampled[i]);
++    {
++        /* Motion blur off by default (owner 2026-11-09: flicker while driving and
++         * right after stopping; the ring is a feedback layer): skip its composite,
++         * a draw into a full-size surface sampling the 320x240 ring
++         * 0x82EBA380/0x82F05400. NFSU2_BLUR_OFF=0 keeps the title's blur. */
++        static int blur_off = -1;
++        if (blur_off < 0) { const char *e = getenv("NFSU2_BLUR_OFF"); blur_off = !(e && *e == '0'); }
++        if (blur_off && s->w >= 640)
++            for (i = 0; i < 4; i++)
++                if (sampled[i] && sampled[i]->w == 320 && sampled[i]->h == 240 &&
++                    ((sampled[i]->va & 0x0FFFFFFFu) == 0x02EBA380u || (sampled[i]->va & 0x0FFFFFFFu) == 0x02F05400u))
++                    return;
++    }
+     texflip_note(b, tex);
+     {
+         /* All stages in this draw read the same pre-draw contents. A 4×

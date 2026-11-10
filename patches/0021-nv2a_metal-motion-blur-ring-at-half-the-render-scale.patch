@@ -1,0 +1,152 @@
+From cad6a58b761130b42826045eb5301ea2868b5cd8 Mon Sep 17 00:00:00 2001
+From: LeoDeadware <351117497+LeoDeadware@users.noreply.github.com>
+Date: Mon, 9 Nov 2026 23:13:07 +0200
+Subject: [PATCH 21/24] nv2a_metal: motion-blur ring at half the render scale
+ (2:1 as on the Xbox); NFSU2_TEXFLIP diagnostics
+
+Owner 2026-11-09 'textures jumping': at 4x the 320x240 blur ring stayed at 1x, so its 4 taps
+covered 2x2 of every 8x8 pixels and the blur layer aliased/crawled at speed. NFSU2_BLUR_SCALE
+(0 = old). Flicker A-B-A 1.76% -> 0.48%, GPU p50 13.2 -> 13.4 ms, 0 frames over 16.7 ms.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ xboxrecomp/src/nv2a_metal/nv2a_metal.m | 98 +++++++++++++++++++++++++-
+ 1 file changed, 95 insertions(+), 3 deletions(-)
+
+diff --git a/xboxrecomp/src/nv2a_metal/nv2a_metal.m b/xboxrecomp/src/nv2a_metal/nv2a_metal.m
+index c2b3ec8..8f5d918 100644
+--- a/xboxrecomp/src/nv2a_metal/nv2a_metal.m
++++ b/xboxrecomp/src/nv2a_metal/nv2a_metal.m
+@@ -326,6 +326,20 @@ static double offscreen_scale(uint32_t w, uint32_t h)
+         k = e && *e ? strtod(e, NULL) : 1.0;
+         if (k > 0 && k < 0.5) k = 0.5;
+     }
++    /* Motion blur (owner 2026-11-09 "текстури стрибають"): the 320x240 ring
++     * (0x82EBA380/0x82F05400) is the back buffer reduced with 4 taps, a 2x2 box at the
++     * Xbox's 2:1. At 4x with the ring at 1x the taps cover 2x2 of every 8x8 pixels:
++     * the blurred layer aliases and crawls at speed. NFSU2_BLUR_SCALE=<k> (default
++     * half the render scale, 2:1 as on the Xbox; 0 = the offscreen scale). */
++    if (w == 320 && h == 240) {
++        static double kb = -2;                  /* -1 = default: half the render scale */
++        if (kb == -2) {
++            const char *e = getenv("NFSU2_BLUR_SCALE");
++            kb = e && *e ? strtod(e, NULL) : -1;
++        }
++        if (kb < 0 && s_scale * 0.5 > 1.0) return s_scale * 0.5;
++        if (kb > 0) return kb < s_scale ? kb : s_scale;
++    }
+     return (k > 0 && (w < 512 || h < 384) && k < s_scale) ? k : s_scale;
+ }
+ 
+@@ -1529,6 +1543,7 @@ static void rt_scale(uint32_t w, uint32_t h, uint32_t sw, uint32_t sh,
+ 
+ /* Stage i: its texture (a surface or a cached texture), sampler and
+  * texcoord scale. Records uploads, so call it before the pass begins. */
++static uint32_t s_nomip_draws, s_onelvl_draws, s_stage_draws;   /* stage binds at the title's no-mip level 0 (NFSU2_TEXFLIP log) */
+ static void bind_stage(const uint32_t *regs, int i, float scale[2], __strong id<MTLTexture> *tex_out,
+                        __strong id<MTLSamplerState> *smp_out, MtSurf **sampled)
+ {
+@@ -1593,9 +1608,19 @@ static void bind_stage(const uint32_t *regs, int i, float scale[2], __strong id<
+     key = (addr & 0xF0F);
+     if (((filter >> 24) & 0xF) == 1) key |= 0x10000;
+     if (((filter >> 16) & 0xFF) == 1) key |= 0x20000;
+-    if (((filter >> 16) & 0xFF) <= 2 && !rt && *tex_out && (*tex_out).mipmapLevelCount > 1
+-        && (*tex_out).width <= w)
+-        key |= 0x40000;                         /* title's no-mip filter: level 0 (not HD) */
++    {
++        static int title_nomip = -1;            /* NFSU2_TITLE_NOMIP=0: mips even where the title asks none */
++        if (title_nomip < 0) { const char *e = getenv("NFSU2_TITLE_NOMIP"); title_nomip = !(e && *e == '0'); }
++        if (title_nomip && ((filter >> 16) & 0xFF) <= 2 && !rt && *tex_out && (*tex_out).mipmapLevelCount > 1
++            && (*tex_out).width <= w) {
++            key |= 0x40000;                     /* title's no-mip filter: level 0 (not HD) */
++            s_nomip_draws++;
++        }
++    }
++    if (!rt && *tex_out && (*tex_out).textureType == MTLTextureType2D) {
++        s_stage_draws++;
++        if ((*tex_out).mipmapLevelCount == 1 && (*tex_out).width >= 128) s_onelvl_draws++;
++    }
+     if (!(key & 0x30000) && !rt && *tex_out && (*tex_out).mipmapLevelCount > 1) {
+         int an = nv2a_vk_aniso;                 /* 1 = off; HD textures carry the mips */
+         if (an > 16) an = 16;
+@@ -1604,6 +1629,72 @@ static void bind_stage(const uint32_t *regs, int i, float scale[2], __strong id<
+     *smp_out = sampler_get(key);
+ }
+ 
++/* NFSU2_TEXFLIP=1 (diagnostic, owner 2026-11-09 "текстури стрибають"): per mesh (vertex
++ * pointer, index count, target), what each stage samples (guest VA, size, levels); logs a mesh
++ * whose texture goes A -> B -> A over consecutive frames, and a per-second count. */
++typedef struct { uint64_t key; uint64_t cur[4], prev[4]; uint32_t f_cur, f_prev; } TexFlip;
++static TexFlip *s_tf;
++static int s_tf_on = -1;
++static uint32_t s_tf_hits, s_tf_logged, s_tf_frame_sec, s_tf_chg, s_tf_chg_logged;
++static void texflip_note(const Nv2aRawBatch *b, __strong id<MTLTexture> *tex)
++{
++    uint64_t key, sig;
++    uint32_t h, i, n;
++    TexFlip *e;
++    if (s_tf_on < 0) {
++        const char *ev = getenv("NFSU2_TEXFLIP");
++        s_tf_on = ev && *ev == '1';
++        if (s_tf_on) s_tf = calloc(1u << 16, sizeof *s_tf);
++    }
++    if (!s_tf_on || !s_tf)
++        return;
++    key = (uint64_t)(uintptr_t)b->direct[0].ptr ^ ((uint64_t)b->index_count << 40)
++        ^ ((uint64_t)b->color_va << 20) ^ ((uint64_t)b->vp_const_count << 56);
++    h = (uint32_t)((key * 0x9E3779B97F4A7C15ull) >> 48);
++    for (n = 0; n < 8; n++, h = (h + 1) & 0xFFFF)
++        if (!s_tf[h].key || s_tf[h].key == key)
++            break;
++    e = &s_tf[h];
++    if (e->key != key) { memset(e, 0, sizeof *e); e->key = key; }
++    if (e->f_cur != s_frame) {
++        if (e->f_cur) { memcpy(e->prev, e->cur, sizeof e->cur); e->f_prev = e->f_cur; }
++        e->f_cur = s_frame;
++        for (i = 0; i < 4; i++) {
++            id<MTLTexture> t = tex[i];
++            sig = t ? ((uint64_t)b->tex_va[i] << 32) ^ ((uint64_t)t.width << 16) ^ t.mipmapLevelCount : 0;
++            if (e->f_prev && e->f_prev + 2 >= s_frame && e->cur[i] && sig && sig != e->cur[i]
++                && sig == e->prev[i]) {
++                s_tf_hits++;
++                if (s_tf_logged++ < 60)
++                    fprintf(stderr, "[texflip] f%u st%u mesh %p n%u rt %08X: %08X %ux%u/%u -> back (via %08llX w%llu l%llu)\n",
++                            s_frame, i, (void *)b->direct[0].ptr, b->index_count, b->color_va, b->tex_va[i],
++                            (unsigned)t.width, (unsigned)t.height, (unsigned)t.mipmapLevelCount,
++                            (unsigned long long)(e->cur[i] >> 32), (unsigned long long)((e->cur[i] >> 16) & 0xFFFF),
++                            (unsigned long long)(e->cur[i] & 0xFFFF));
++            }
++            if (e->f_prev && e->f_prev + 2 >= s_frame && e->cur[i] && sig && sig != e->cur[i]
++                && sig != e->prev[i]) {
++                s_tf_chg++;
++                if (s_frame > 2400 && t.width >= 64 && ((e->cur[i] >> 16) & 0xFFFF) >= 64
++                    && s_tf_chg_logged++ < 400)
++                    fprintf(stderr, "[texchg] f%u st%u mesh %p n%u rt %08X: %08llX w%llu l%llu -> %08X %ux%u/%u\n",
++                            s_frame, i, (void *)b->direct[0].ptr, b->index_count, b->color_va,
++                            (unsigned long long)(e->cur[i] >> 32), (unsigned long long)((e->cur[i] >> 16) & 0xFFFF),
++                            (unsigned long long)(e->cur[i] & 0xFFFF), b->tex_va[i],
++                            (unsigned)t.width, (unsigned)t.height, (unsigned)t.mipmapLevelCount);
++            }
++            e->cur[i] = sig;
++        }
++    }
++    if (s_frame / 60 != s_tf_frame_sec) {
++        s_tf_frame_sec = s_frame / 60;
++        fprintf(stderr, "[texflip] %u A-B-A, %u level-0 (title no-mip) binds in the last 60 frames; %u of %u 2D binds single-level >=128 px; %u A-B changes\n",
++                s_tf_hits, s_nomip_draws, s_onelvl_draws, s_stage_draws, s_tf_chg);
++        s_tf_chg = 0;
++        s_tf_hits = s_nomip_draws = s_onelvl_draws = s_stage_draws = 0;
++    }
++}
++
+ /* A draw that samples the surface it renders into reads a copy taken just
+  * before it: Metal does not allow sampling a pass's own attachment. */
+ static __strong id<MTLTexture> s_feedback;
+@@ -3130,6 +3221,7 @@ static void mtl_draw_raw_inner(const Nv2aRawBatch *b)
+     /* Textures first: uploads and copies end the pass. */
+     for (i = 0; i < 4; i++)
+         bind_stage(r, (int)i, tscale[i], &tex[i], &smp[i], &sampled[i]);
++    texflip_note(b, tex);
+     {
+         /* All stages in this draw read the same pre-draw contents. A 4×
+          * surface is large: copy it once even if several stages sample it.
