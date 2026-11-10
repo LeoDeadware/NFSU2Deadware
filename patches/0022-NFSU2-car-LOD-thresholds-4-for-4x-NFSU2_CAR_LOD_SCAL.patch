@@ -1,7 +1,7 @@
 From e80fa4ecf650f95f82325ea1f938bfdbf6c4866f Mon Sep 17 00:00:00 2001
 From: LeoDeadware <351117497+LeoDeadware@users.noreply.github.com>
 Date: Mon, 9 Nov 2026 23:58:02 +0200
-Subject: [PATCH 22/24] NFSU2: car LOD thresholds /4 for 4x
+Subject: [PATCH 22/25] NFSU2: car LOD thresholds /4 for 4x
  (NFSU2_CAR_LOD_SCALE); motion blur composite off by default (NFSU2_BLUR_OFF=0
  keeps it)
 

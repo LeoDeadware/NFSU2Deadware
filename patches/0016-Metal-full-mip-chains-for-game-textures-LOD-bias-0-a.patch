@@ -1,7 +1,7 @@
 From d11dccc020acd672b26dbb5041e94897797bcb28 Mon Sep 17 00:00:00 2001
 From: LeoDeadware <351117497+LeoDeadware@users.noreply.github.com>
 Date: Sat, 7 Nov 2026 21:37:38 +0200
-Subject: [PATCH 16/24] Metal: full mip chains for game textures (LOD bias 0,
+Subject: [PATCH 16/25] Metal: full mip chains for game textures (LOD bias 0,
  aniso on mipped) - road moire; window activation at start + pads monitored in
  background; RECOMP_GL_DUMP_AT consecutive-frame dumps (v1.0.1)
 

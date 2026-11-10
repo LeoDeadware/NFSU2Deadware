@@ -1,7 +1,7 @@
 From 7bd8e8af5cff4e099ccc8dc8bd5bc6556bdec82f Mon Sep 17 00:00:00 2001
 From: LeoDeadware <351117497+LeoDeadware@users.noreply.github.com>
 Date: Sat, 7 Nov 2026 20:04:23 +0200
-Subject: [PATCH 15/24] macOS: pad events without focus + window activation;
+Subject: [PATCH 15/25] macOS: pad events without focus + window activation;
  movies in full range (v1.0.1)
 
 Owner 2026-11-07: gamepad dead in the borderless full-panel window (not key,

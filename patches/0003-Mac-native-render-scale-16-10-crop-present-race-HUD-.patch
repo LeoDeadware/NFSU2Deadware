@@ -1,7 +1,7 @@
 From e40795011a17182132cdc3e89715b0348b864ef8 Mon Sep 17 00:00:00 2001
 From: LeoDeadware <351117497+LeoDeadware@users.noreply.github.com>
 Date: Fri, 6 Nov 2026 22:21:06 +0200
-Subject: [PATCH 03/24] Mac: native render scale, 16:10 crop present, race HUD
+Subject: [PATCH 03/25] Mac: native render scale, 16:10 crop present, race HUD
  moved into the visible corners
 
 - nv2a_metal: render scale follows the drawable (h/480, 1..4x) unless the

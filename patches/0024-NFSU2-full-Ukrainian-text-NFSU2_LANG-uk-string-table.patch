@@ -1,7 +1,7 @@
 From ea625ff410700d13a3e115455e3f4ace3b297483 Mon Sep 17 00:00:00 2001
 From: LeoDeadware <351117497+LeoDeadware@users.noreply.github.com>
 Date: Tue, 10 Nov 2026 02:04:45 +0200
-Subject: [PATCH 24/24] NFSU2: full Ukrainian text (NFSU2_LANG=uk): string
+Subject: [PATCH 24/25] NFSU2: full Ukrainian text (NFSU2_LANG=uk): string
  table from text_uk.inc, Cyrillic glyphs drawn into the game's fonts from
  macOS system fonts (font_uk.m)
 

@@ -1,7 +1,7 @@
 From cad6a58b761130b42826045eb5301ea2868b5cd8 Mon Sep 17 00:00:00 2001
 From: LeoDeadware <351117497+LeoDeadware@users.noreply.github.com>
 Date: Mon, 9 Nov 2026 23:13:07 +0200
-Subject: [PATCH 21/24] nv2a_metal: motion-blur ring at half the render scale
+Subject: [PATCH 21/25] nv2a_metal: motion-blur ring at half the render scale
  (2:1 as on the Xbox); NFSU2_TEXFLIP diagnostics
 
 Owner 2026-11-09 'textures jumping': at 4x the 320x240 blur ring stayed at 1x, so its 4 taps

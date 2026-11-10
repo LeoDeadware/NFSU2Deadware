@@ -1,0 +1,195 @@
+From 0b69f01e3ab11a5719c20c97ee738617f88fc949 Mon Sep 17 00:00:00 2001
+From: LeoDeadware <351117497+LeoDeadware@users.noreply.github.com>
+Date: Tue, 10 Nov 2026 03:04:00 +0200
+Subject: [PATCH 25/25] UA fonts: patch at the font chunk (sub_00139C20), even
+ spacing, matching weight
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+- Every font is patched when its chunk loads (no late patch).
+- Ї/ї advance covers the painted glyph (the game's Ï kept I's advance).
+- Drawn glyphs get a fill+stroke weight matching the game's letters.
+- conduitmditc_tt14i drawn upright (its own Latin glyphs are upright).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/apple/font_uk.m | 73 ++++++++++++++++++++++++++++++++++++++++++---
+ src/recomp_manual.c | 20 +++++++++++++
+ 2 files changed, 89 insertions(+), 4 deletions(-)
+
+diff --git a/src/apple/font_uk.m b/src/apple/font_uk.m
+index 3bf0429..e96b023 100644
+--- a/src/apple/font_uk.m
++++ b/src/apple/font_uk.m
+@@ -125,11 +125,16 @@ static int cmp_rec(const void *a, const void *b)
+     return (int)((const Rec *)a)->code - (int)((const Rec *)b)->code;
+ }
+ 
++/* Extra stroke (px) round the drawn glyphs: PT Sans Narrow is lighter than the game's Conduit
++   ITC Medium (tt14i/tt21i); the bold 38bi matches as is. */
++static CGFloat s_stroke;
++
+ static CTFontRef make_font(const char *name, const Rec *H, CGFloat *base_fix)
+ {
+     /* System fonts with Cyrillic (Avenir Next Condensed has none): PT Sans Narrow, slanted
+        like the game's Conduit italics. */
+-    int ital = strstr(name, "conduit") != NULL;
++    /* tt14i's own glyphs are upright Arial-like ones despite the name -> Arial, unslanted. */
++    int ital = strstr(name, "conduit") != NULL && !strstr(name, "tt14i");
+     const char *ps = strstr(name, "38bi") ? "PTSans-NarrowBold" : ital ? "PTSans-Narrow" : "ArialMT";
+     CFStringRef n = CFStringCreateWithCString(NULL, ps, kCFStringEncodingASCII);
+     CTFontRef f1 = CTFontCreateWithName(n, 100, NULL), f;
+@@ -149,6 +154,7 @@ static CTFontRef make_font(const char *name, const Rec *H, CGFloat *base_fix)
+     CGAffineTransform m = CGAffineTransformMake(sx, 0, ital ? 0.21 : 0, 1, 0, 0);
+     f = CTFontCreateWithName(n, size, &m);
+     *base_fix = 0;
++    s_stroke = strstr(name, "38bi") || !strstr(name, "conduit") ? 0 : size * (ital ? 0.025 : 0.04);
+     CFRelease(f1);
+     CFRelease(n);
+     return f;
+@@ -163,6 +169,7 @@ static int render(CTFontRef f, unichar c, int baseline, Rec *r, uint8_t **alpha)
+     if (!CTFontGetGlyphsForCharacters(f, &c, &g, 1)) return 0;
+     bb = CTFontGetBoundingRectsForGlyphs(f, kCTFontOrientationHorizontal, &g, NULL, 1);
+     CTFontGetAdvancesForGlyphs(f, kCTFontOrientationHorizontal, &g, &adv, 1);
++    bb = CGRectInset(bb, -s_stroke / 2, -s_stroke / 2);
+     int x0 = (int)floor(bb.origin.x), x1 = (int)ceil(bb.origin.x + bb.size.width);
+     int y0 = (int)floor(bb.origin.y), y1 = (int)ceil(bb.origin.y + bb.size.height);
+     int w = x1 - x0 + 2, h = y1 - y0 + 2;           /* 1 px of AA room each side */
+@@ -173,7 +180,20 @@ static int render(CTFontRef f, unichar c, int baseline, Rec *r, uint8_t **alpha)
+     CGContextSetShouldAntialias(cx, true);
+     CGContextSetShouldSmoothFonts(cx, false);
+     CGPoint pos = CGPointMake(1 - x0, 1 - y0);
+-    CTFontDrawGlyphs(f, &g, &pos, 1, cx);
++    if (s_stroke > 0) {
++        CGAffineTransform t = CGAffineTransformMakeTranslation(pos.x, pos.y);
++        CGPathRef path = CTFontCreatePathForGlyph(f, g, &t);
++        if (path) {
++            CGContextAddPath(cx, path);
++            CGContextSetLineWidth(cx, s_stroke);
++            CGContextSetLineJoin(cx, kCGLineJoinRound);
++            CGContextSetGrayStrokeColor(cx, 0, 1);
++            CGContextSetGrayFillColor(cx, 0, 1);
++            CGContextDrawPath(cx, kCGPathFillStroke);
++            CGPathRelease(path);
++        }
++    } else
++        CTFontDrawGlyphs(f, &g, &pos, 1, cx);
+     CGContextRelease(cx);
+     int top = baseline - (y1 + 1);                  /* rows above the bitmap's top */
+     int skip = 0;
+@@ -198,7 +218,7 @@ static int render(CTFontRef f, unichar c, int baseline, Rec *r, uint8_t **alpha)
+     r->w = (uint8_t)w; r->h = (uint8_t)h;
+     r->xoff = (int8_t)(x0 - 1);
+     r->yoff = (uint8_t)(top > 255 ? 255 : top);
+-    r->adv = (uint16_t)lround(adv.width);
++    r->adv = (uint16_t)lround(adv.width + s_stroke / 2);
+     *alpha = a;
+     return 1;
+ }
+@@ -310,6 +330,14 @@ static void build(Font *f)
+         if (L) {
+             Rec r = *L;
+             r.code = (uint16_t)b; r.kc = 0; r.ki = 0;
++            /* Ï ï: the font keeps I's advance, so the diaeresis (wider than the stem) runs into
++               the next letter; Ї ї are frequent in Ukrainian -> advance from the painted width,
++               minus the plain I/i's italic overhang. */
++            if (lat == 0xCF || lat == 0xEF) {
++                const Rec *P = find(f->orig, n, lat == 0xCF ? 'I' : 'i');
++                int over = P && P->w > P->adv ? P->w - P->adv : 0;
++                if (r.w - over > r.adv) r.adv = (uint16_t)(r.w - over);
++            }
+             f->out[nout++] = r;
+             looks++;
+             continue;
+@@ -405,7 +433,21 @@ static void patch_font(uint8_t *chunk, uint8_t *fntx, size_t avail, int late)
+     pthread_mutex_lock(&s_mu);
+     for (i = 0; i < s_nfont; i++)
+         if (s_font[i].sig == sig && !strcmp(s_font[i].name, name)) { f = &s_font[i]; break; }
+-        else if (!memcmp(s_font[i].out, tab, 16ull * n) && s_font[i].n == n) { pthread_mutex_unlock(&s_mu); return; }
++        else if (!memcmp(s_font[i].out, tab, 16ull * n) && s_font[i].n == n) {
++            /* The guest-RAM scan can find a font chunk (patching it late) before the game's
++               chunk handler reads it; nfsu2_font_uk_chunk then still comes first, so rebuild
++               it as a normal font from the saved original. */
++            if (s_font[i].late && !late) {
++                f = &s_font[i];
++                free(f->keep); f->keep = NULL;
++                for (int d = 0; d < f->ndrawn; d++) free(f->drawn[d].alpha);
++                f->ndrawn = 0; f->late = 0;
++                fprintf(stderr, "[UA] font %s: chunk handler, rebuilt from the late patch\n", f->name);
++                build(f);
++                memcpy(tab, f->out, 16ull * n);
++            }
++            pthread_mutex_unlock(&s_mu); return;
++        }
+     if (!f && s_nfont < MAX_FONTS) {
+         f = &s_font[s_nfont];
+         memset(f, 0, sizeof *f);
+@@ -442,6 +484,15 @@ void nfsu2_font_uk_scan(void *buf, size_t len)
+     }
+ }
+ 
++/* recomp_manual.c's font chunk handler (sub_00139C20): one font chunk, before the game builds
++   its font object from it. */
++void nfsu2_font_uk_chunk(void *chunk, size_t len)
++{
++    uint8_t *c = chunk;
++    if (len < 0x208 + 0x60 || len > (16u << 20) || memcmp(c + 0x208, "FNTX", 4)) return;
++    patch_font(c, c + 0x208, len - 0x208, 0);
++}
++
+ /* Fonts the read hook never sees (loaded compressed, or split over reads) are patched in guest
+    RAM: their atlas is uploaded after the font chunk is in memory, so a new atlas-sized UI texture
+    with no matching font triggers one pass over RAM for unpatched FNTX headers (~5 ms). */
+@@ -572,6 +623,20 @@ static void fit_glyph(const Drawn *g, const uint32_t *atlas, uint32_t W, uint32_
+             s_atlases[@(ti->hash)] = [NSData dataWithBytesNoCopy:px length:(size_t)n * 4 freeWhenDone:YES];
+             fprintf(stderr, "[UA] atlas %016llx %ux%u = %s (%u of %u glyph rects inked), %d glyphs drawn in\n",
+                     (unsigned long long)ti->hash, ti->w, ti->h, f->name, bhit, btested, f->ndrawn);
++            const char *dd = getenv("NFSU2_UA_DUMP");   /* tools/loc_nfsu2/font_sheet.py reads these */
++            if (dd && *dd) {
++                char path[1024];
++                snprintf(path, sizeof path, "%s/%s.font", dd, f->name);
++                FILE *o = fopen(path, "wb");
++                if (o) {
++                    uint32_t hdr[4] = { ti->w, ti->h, f->n, (uint32_t)f->late };
++                    fwrite(hdr, 4, 4, o);
++                    fwrite(f->orig, 16, f->n, o);
++                    fwrite(f->out, 16, f->n, o);
++                    fwrite(px, 4, n, o);
++                    fclose(o);
++                }
++            }
+             ret = px;
+         } else if (!scanned && ti->flat && ti->w >= 128 && ti->h >= 64 && ti->w <= 1024 && ti->h <= 1024
+                    && !(ti->w & (ti->w - 1)) && !(ti->h & (ti->h - 1))) {
+diff --git a/src/recomp_manual.c b/src/recomp_manual.c
+index 1f504ff..fa090d3 100644
+--- a/src/recomp_manual.c
++++ b/src/recomp_manual.c
+@@ -1929,6 +1929,26 @@ void sub_0025ECB4(void)
+     }
+ }
+ 
++/* ── Font chunks, sub_00139C20 (Deadware, Ukrainian fonts) ──
++ *
++ * cdecl (chunk): the bChunk handler for font chunks (id 0x30201, size at +4,
++ * FNTX header at +0x208); it builds the game's font object from the glyph
++ * table. The dialog font conduitmditc_tt21i arrives in a JDLZ pack the read
++ * hook never sees, so every font chunk is rebuilt here before the game reads
++ * it (font_uk.m, NFSU2_LANG=uk only; fonts already patched are left alone). */
++extern void sub_00139C20_gen(void);
++int nfsu2_text_uk_active(void) __attribute__((weak));
++void nfsu2_font_uk_chunk(void *chunk, size_t len) __attribute__((weak));
++
++void sub_00139C20(void)
++{
++    uint32_t chunk = MEM32(esp + 4);
++
++    if (chunk && MEM32(chunk) == 0x30201u && nfsu2_font_uk_chunk && nfsu2_text_uk_active && nfsu2_text_uk_active())
++        nfsu2_font_uk_chunk((void *)XBOX_PTR(chunk), (size_t)MEM32(chunk + 4) + 8);
++    sub_00139C20_gen();
++}
++
+ /* ── Movie file names, sub_00129610 ──────────────────────────
+  *
+  * cdecl (buf, size, name): snprintf "%sMOVIES\\%s%s" -- the path of a movie

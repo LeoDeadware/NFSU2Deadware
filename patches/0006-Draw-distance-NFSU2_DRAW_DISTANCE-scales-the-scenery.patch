@@ -1,7 +1,7 @@
 From 9cc7fc9b66839bf0c598d423c3b7aff6f13ba69e Mon Sep 17 00:00:00 2001
 From: LeoDeadware <351117497+LeoDeadware@users.noreply.github.com>
 Date: Fri, 6 Nov 2026 23:27:50 +0200
-Subject: [PATCH 06/24] Draw distance: NFSU2_DRAW_DISTANCE scales the scenery
+Subject: [PATCH 06/25] Draw distance: NFSU2_DRAW_DISTANCE scales the scenery
  drawer's screen size (default x2)
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

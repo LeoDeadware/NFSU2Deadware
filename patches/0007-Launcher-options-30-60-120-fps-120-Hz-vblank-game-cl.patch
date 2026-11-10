@@ -1,7 +1,7 @@
 From 4075f2e1265791864d9327c2eb309bc435e7788f Mon Sep 17 00:00:00 2001
 From: LeoDeadware <351117497+LeoDeadware@users.noreply.github.com>
 Date: Sat, 7 Nov 2026 01:20:12 +0200
-Subject: [PATCH 07/24] Launcher options: 30/60/120 fps (120 Hz vblank, game
+Subject: [PATCH 07/25] Launcher options: 30/60/120 fps (120 Hz vblank, game
  clock kept real), gamma, SSAO + emissive bloom, hold A to skip movies
 
 120 fps: vblank at 119.88 Hz; the title's vblank counter 0x4289AC is kept at

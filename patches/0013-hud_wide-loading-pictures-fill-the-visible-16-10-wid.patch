@@ -1,7 +1,7 @@
 From 75ccd1c6a4d043a227bb09dbfb031de6881a9c93 Mon Sep 17 00:00:00 2001
 From: LeoDeadware <351117497+LeoDeadware@users.noreply.github.com>
 Date: Sat, 7 Nov 2026 18:58:10 +0200
-Subject: [PATCH 13/24] hud_wide: loading pictures fill the visible 16:10 width
+Subject: [PATCH 13/25] hud_wide: loading pictures fill the visible 16:10 width
  (zoom vis/0.707 of the 4:3-at-90% quad; v1.0.1, Head 2026-11-07);
  NFSU2_LOAD_TRACE/NFSU2_LOAD_DUMP traces
 
