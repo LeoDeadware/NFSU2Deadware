@@ -1,7 +1,7 @@
 From 41b7ed2f53f99413b00f865aaeb113e598fb3b87 Mon Sep 17 00:00:00 2001
 From: LeoDeadware <351117497+LeoDeadware@users.noreply.github.com>
 Date: Thu, 5 Nov 2026 12:29:40 +0200
-Subject: [PATCH 01/25] macOS local baseline: native dependencies and bounded
+Subject: [PATCH 01/26] macOS local baseline: native dependencies and bounded
  smoke launch
 
 ---

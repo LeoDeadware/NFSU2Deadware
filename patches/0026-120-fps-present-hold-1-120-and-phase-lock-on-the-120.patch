@@ -1,0 +1,38 @@
+From ccdd04dfd754fa6e3d24020c47c601eeaf447935 Mon Sep 17 00:00:00 2001
+From: LeoDeadware <351117497+LeoDeadware@users.noreply.github.com>
+Date: Tue, 10 Nov 2026 12:01:18 +0200
+Subject: [PATCH 26/26] 120 fps: present hold 1/120 and phase lock on the 120
+ Hz grid (launcher 120 was held at 60 on screen)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ xboxrecomp/src/nv2a_metal/nv2a_metal.m | 9 ++++++---
+ 1 file changed, 6 insertions(+), 3 deletions(-)
+
+diff --git a/xboxrecomp/src/nv2a_metal/nv2a_metal.m b/xboxrecomp/src/nv2a_metal/nv2a_metal.m
+index 8069eb9..777799f 100644
+--- a/xboxrecomp/src/nv2a_metal/nv2a_metal.m
++++ b/xboxrecomp/src/nv2a_metal/nv2a_metal.m
+@@ -162,8 +162,10 @@ static void pres_lock(CFTimeInterval shown)
+         return;
+     /* the grid point in the vblank's clock (CLOCK_MONOTONIC us) */
+     g = (long long)(hz_now() / 1000) - (long long)((CACurrentMediaTime() - shown) * 1e6);
+-    if (P < 16000) P *= 2;            /* 120 Hz vblank: lock every other tick to the 60 Hz grid */
+-    err = (xbox_vblank_next_us() - g - s_pres_phase) % P;
++    /* 120 Hz vblank (launcher "120 fps"): lock to the panel's 120 Hz grid,
++     * the phase scaled to the shorter period (was: every other tick to 60 Hz,
++     * which with the 1/60 hold below kept the screen at 60 fps). */
++    err = (xbox_vblank_next_us() - g - (P < 16000 ? s_pres_phase * P / 16667 : s_pres_phase)) % P;
+     if (err < 0) err += P;
+     if (err > P / 2) err -= P;        /* > 0: the vblank is late against the grid */
+     step = -err / 8;
+@@ -3754,7 +3756,8 @@ static void present(MtSurf *s)
+             }];
+     }
+     if (pres_mode() == 2)
+-        [s_cb presentDrawable:drawable afterMinimumDuration:1.0 / 60.0];
++        [s_cb presentDrawable:drawable afterMinimumDuration:
++              xbox_vblank_period_us() < 16000 ? 1.0 / 120.0 : 1.0 / 60.0];   /* 120 fps: hold one 120 Hz refresh */
+     else
+         [s_cb presentDrawable:drawable];
+ }

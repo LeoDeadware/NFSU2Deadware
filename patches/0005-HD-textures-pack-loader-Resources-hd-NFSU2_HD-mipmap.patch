@@ -1,7 +1,7 @@
 From 33973ede893b4bf20929e90ed1a758feef661218 Mon Sep 17 00:00:00 2001
 From: LeoDeadware <351117497+LeoDeadware@users.noreply.github.com>
 Date: Fri, 6 Nov 2026 23:27:50 +0200
-Subject: [PATCH 05/25] HD textures: pack loader (Resources/hd, NFSU2_HD),
+Subject: [PATCH 05/26] HD textures: pack loader (Resources/hd, NFSU2_HD),
  mipmapped replacements, ui/world dump names
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

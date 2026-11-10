@@ -1,7 +1,7 @@
 From d62852b2a8e4dc6a4eb6524650e45de5eff6cf1f Mon Sep 17 00:00:00 2001
 From: LeoDeadware <351117497+LeoDeadware@users.noreply.github.com>
 Date: Fri, 6 Nov 2026 20:36:18 +0200
-Subject: [PATCH 02/25] macOS Metal-only build: no
+Subject: [PATCH 02/26] macOS Metal-only build: no
  Vulkan/glslang/SPIRV-Tools/OpenSSL at run time
 
 ---

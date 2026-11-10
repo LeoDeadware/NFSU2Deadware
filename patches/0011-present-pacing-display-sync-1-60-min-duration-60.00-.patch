@@ -1,7 +1,7 @@
 From 69272446bc3f095fd60e96c3264a1c008da564e7 Mon Sep 17 00:00:00 2001
 From: LeoDeadware <351117497+LeoDeadware@users.noreply.github.com>
 Date: Sat, 7 Nov 2026 16:00:22 +0200
-Subject: [PATCH 11/25] present pacing: display sync + 1/60 min duration, 60.00
+Subject: [PATCH 11/26] present pacing: display sync + 1/60 min duration, 60.00
  Hz vblank phase-locked to the display (+9 ms), [present] presentedTime stats;
  front end fitted whole (pillarbox), draw distance and offscreen scale 1.0
 

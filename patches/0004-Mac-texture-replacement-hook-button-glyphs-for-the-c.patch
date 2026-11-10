@@ -1,7 +1,7 @@
 From a05ae928365ede8f30af6d2694b75ace7e651ad6 Mon Sep 17 00:00:00 2001
 From: LeoDeadware <351117497+LeoDeadware@users.noreply.github.com>
 Date: Fri, 6 Nov 2026 22:40:10 +0200
-Subject: [PATCH 04/25] Mac: texture replacement hook + button glyphs for the
+Subject: [PATCH 04/26] Mac: texture replacement hook + button glyphs for the
  connected pad
 
 - nv2a_metal: nv2a_tex_replace_hook (full FNV-64 of the guest bytes, decoded

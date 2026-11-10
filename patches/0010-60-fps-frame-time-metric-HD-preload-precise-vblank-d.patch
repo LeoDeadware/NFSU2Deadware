@@ -1,7 +1,7 @@
 From d9fad426921e4df0df3e8ee69fafcfa05c128568 Mon Sep 17 00:00:00 2001
 From: LeoDeadware <351117497+LeoDeadware@users.noreply.github.com>
 Date: Sat, 7 Nov 2026 14:24:05 +0200
-Subject: [PATCH 10/25] 60 fps: frame-time metric, HD preload, precise vblank,
+Subject: [PATCH 10/26] 60 fps: frame-time metric, HD preload, precise vblank,
  default 2.0x without SSAO
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8

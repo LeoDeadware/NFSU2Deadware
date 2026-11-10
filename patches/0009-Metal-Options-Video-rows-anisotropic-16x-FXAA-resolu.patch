@@ -1,7 +1,7 @@
 From 557cc876e3e1d706b9679bbe63d96b330f2c054e Mon Sep 17 00:00:00 2001
 From: LeoDeadware <351117497+LeoDeadware@users.noreply.github.com>
 Date: Sat, 7 Nov 2026 11:30:44 +0200
-Subject: [PATCH 09/25] Metal: Options->Video rows (anisotropic 16x, FXAA,
+Subject: [PATCH 09/26] Metal: Options->Video rows (anisotropic 16x, FXAA,
  resolution scale to 2.5x/native, car reflections)
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

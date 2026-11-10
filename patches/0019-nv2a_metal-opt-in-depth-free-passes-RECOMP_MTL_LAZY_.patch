@@ -1,7 +1,7 @@
 From 81985c1a819b1d38d2a83de2fe35c7ad9432659b Mon Sep 17 00:00:00 2001
 From: LeoDeadware <351117497+LeoDeadware@users.noreply.github.com>
 Date: Sun, 8 Nov 2026 00:31:16 +0200
-Subject: [PATCH 19/25] nv2a_metal: opt-in depth-free passes
+Subject: [PATCH 19/26] nv2a_metal: opt-in depth-free passes
  (RECOMP_MTL_LAZY_DEPTH=1), predicted per pass index from the previous frame;
  not measured yet
 

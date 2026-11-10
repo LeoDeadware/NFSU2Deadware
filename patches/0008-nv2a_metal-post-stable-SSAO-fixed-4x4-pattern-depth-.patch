@@ -1,7 +1,7 @@
 From b1b69699dbfcc836ae21e66832e88ffb42aed32c Mon Sep 17 00:00:00 2001
 From: LeoDeadware <351117497+LeoDeadware@users.noreply.github.com>
 Date: Sat, 7 Nov 2026 11:10:20 +0200
-Subject: [PATCH 08/25] nv2a_metal post: stable SSAO (fixed 4x4 pattern +
+Subject: [PATCH 08/26] nv2a_metal post: stable SSAO (fixed 4x4 pattern +
  depth-aware 4x4 blur, distance fade, bright pixels kept), scene test
  hysteresis + fade-in
 

@@ -1,7 +1,7 @@
 From 0b69f01e3ab11a5719c20c97ee738617f88fc949 Mon Sep 17 00:00:00 2001
 From: LeoDeadware <351117497+LeoDeadware@users.noreply.github.com>
 Date: Tue, 10 Nov 2026 03:04:00 +0200
-Subject: [PATCH 25/25] UA fonts: patch at the font chunk (sub_00139C20), even
+Subject: [PATCH 25/26] UA fonts: patch at the font chunk (sub_00139C20), even
  spacing, matching weight
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8

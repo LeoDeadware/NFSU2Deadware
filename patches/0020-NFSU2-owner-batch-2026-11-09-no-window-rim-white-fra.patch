@@ -1,7 +1,7 @@
 From 7d0b29e2d6a8e597b8d2d676431534c4c8b4b7de Mon Sep 17 00:00:00 2001
 From: LeoDeadware <351117497+LeoDeadware@users.noreply.github.com>
 Date: Mon, 9 Nov 2026 22:41:24 +0200
-Subject: [PATCH 20/25] NFSU2 owner batch 2026-11-09: no window rim (white
+Subject: [PATCH 20/26] NFSU2 owner batch 2026-11-09: no window rim (white
  frame), invariant positions (multi-pass z-fight), Cmd+Option+F fps counter,
  all six reflection cube faces every frame
 

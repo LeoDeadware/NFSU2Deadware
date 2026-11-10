@@ -1,7 +1,7 @@
 From d2c6ecb83951e38ba2a45f9c9f69dec406fbff8c Mon Sep 17 00:00:00 2001
 From: LeoDeadware <351117497+LeoDeadware@users.noreply.github.com>
 Date: Sat, 7 Nov 2026 23:26:40 +0200
-Subject: [PATCH 18/25] nv2a_metal: refresh dynamic cube faces when their
+Subject: [PATCH 18/26] nv2a_metal: refresh dynamic cube faces when their
  source pass ends (no mid-pass back buffer split); opt-in frame-end depth
  DontCare
 

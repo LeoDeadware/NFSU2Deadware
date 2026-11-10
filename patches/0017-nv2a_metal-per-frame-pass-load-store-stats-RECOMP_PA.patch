@@ -1,7 +1,7 @@
 From 8aa5b418d0316486f3b621348690b87b1afddf26 Mon Sep 17 00:00:00 2001
 From: LeoDeadware <351117497+LeoDeadware@users.noreply.github.com>
 Date: Sat, 7 Nov 2026 22:48:37 +0200
-Subject: [PATCH 17/25] nv2a_metal: per-frame pass/load/store stats,
+Subject: [PATCH 17/26] nv2a_metal: per-frame pass/load/store stats,
  RECOMP_PASS_TRACE, opt-in upload command buffer (RECOMP_MTL_UPLOAD_CB=1)
 
 4x static start line: 19 passes, 2 split by blits, load 389 MB store 447 MB per frame;
