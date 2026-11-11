@@ -1,4 +1,6 @@
-# NFSU2 for Mac
+# Need for Speed Underground 2 for Mac (Xbox port, Apple Silicon)
+
+**Website, screenshots and install guide:** [deadware.games/nfsu2](https://deadware.games/nfsu2/) · [українською](https://deadware.games/uk/nfsu2/)
 
 *Need for Speed: Underground 2* (original Xbox), running natively on macOS: Apple silicon (M1 and newer), macOS 26 or later.
 You need your own copy of the game: this repository and the DMG contain **no game data and no game code**
